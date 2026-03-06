@@ -1,0 +1,90 @@
+entity:
+  name: Obligor
+  description: "Lending obligor (borrower) entity"
+  version: "1.0"
+
+sources:
+  - name: obligor_main
+    type: csv
+    primary: true
+    path: "./data/obligors.csv"
+    options:
+      delimiter: ","
+
+  - name: financial_statements
+    type: parquet
+    path: "data/financials/{year}/*.parquet"
+    parameters:
+      year: "2025"
+
+joins:
+  - left: obligor_main
+    right: financial_statements
+    how: left
+    on:
+      - left_col: obligor_id
+        right_col: obligor_id
+    relationship: one_to_many
+    nested_as: financials
+
+transforms:
+  - type: cast
+    columns:
+      revenue: float64
+      total_assets: float64
+      total_liabilities: float64
+      founded_date: datetime
+
+  - type: derive
+    name: debt_to_asset_ratio
+    expression: "total_liabilities / total_assets"
+    dtype: float64
+
+  - type: fill_na
+    strategy:
+      industry: "UNKNOWN"
+      country: "US"
+
+validations:
+  - type: not_null
+    columns: [obligor_id, legal_name]
+    severity: error
+
+  - type: unique
+    columns: [obligor_id]
+    severity: error
+
+fields:
+  - name: obligor_id
+    dtype: str
+    description: "Unique obligor identifier"
+    primary_key: true
+
+  - name: legal_name
+    dtype: str
+    description: "Legal name of the obligor"
+
+  - name: industry
+    dtype: str
+
+  - name: country
+    dtype: str
+
+  - name: revenue
+    dtype: float64
+
+  - name: total_assets
+    dtype: float64
+
+  - name: total_liabilities
+    dtype: float64
+
+  - name: debt_to_asset_ratio
+    dtype: float64
+
+  - name: founded_date
+    dtype: datetime
+
+  - name: financials
+    dtype: nested
+    entity_ref: FinancialStatement

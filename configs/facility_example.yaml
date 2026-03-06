@@ -1,0 +1,131 @@
+entity:
+  name: Facility
+  description: "Commercial lending facility entity"
+  version: "1.0"
+
+sources:
+  - name: facility_main
+    type: snowflake
+    primary: true
+    connection:
+      account: "${SNOWFLAKE_ACCOUNT}"
+      database: CREDIT_DB
+      schema: LENDING
+      warehouse: ANALYTICS_WH
+    query: |
+      SELECT facility_id, obligor_id, product_type,
+             commitment_amount, outstanding_balance,
+             origination_date, maturity_date, interest_rate
+      FROM facility_master
+      WHERE snapshot_date = :snapshot_date
+    parameters:
+      snapshot_date: "2025-12-31"
+
+  - name: collateral
+    type: parquet
+    path: "data/collateral/{snapshot_date}/*.parquet"
+    parameters:
+      snapshot_date: "2025-12-31"
+
+  - name: rating_overrides
+    type: csv
+    path: "./data/rating_overrides.csv"
+    options:
+      delimiter: ","
+      encoding: "utf-8"
+
+joins:
+  - left: facility_main
+    right: collateral
+    how: left
+    on:
+      - left_col: facility_id
+        right_col: facility_id
+    relationship: one_to_many
+    nested_as: collateral_items
+
+  - left: facility_main
+    right: rating_overrides
+    how: left
+    on:
+      - left_col: facility_id
+        right_col: facility_id
+    relationship: one_to_one
+
+transforms:
+  - type: cast
+    columns:
+      commitment_amount: float64
+      outstanding_balance: float64
+      interest_rate: float64
+      origination_date: datetime
+      maturity_date: datetime
+
+  - type: derive
+    name: utilization_rate
+    expression: "outstanding_balance / commitment_amount"
+    dtype: float64
+
+  - type: rename
+    mapping:
+      product_type: product_category
+
+  - type: fill_na
+    strategy:
+      interest_rate: 0.0
+      product_category: "UNKNOWN"
+
+validations:
+  - type: not_null
+    columns: [facility_id, obligor_id, commitment_amount]
+    severity: error
+
+  - type: unique
+    columns: [facility_id]
+    severity: error
+
+  - type: range
+    column: interest_rate
+    min: 0.0
+    max: 1.0
+    severity: warning
+
+  - type: expression
+    rule: "outstanding_balance <= commitment_amount"
+    message: "Outstanding cannot exceed commitment"
+    severity: warning
+
+fields:
+  - name: facility_id
+    dtype: str
+    description: "Unique facility identifier"
+    primary_key: true
+
+  - name: obligor_id
+    dtype: str
+    description: "FK to obligor entity"
+
+  - name: product_category
+    dtype: str
+
+  - name: commitment_amount
+    dtype: float64
+
+  - name: outstanding_balance
+    dtype: float64
+
+  - name: utilization_rate
+    dtype: float64
+
+  - name: interest_rate
+    dtype: float64
+
+  - name: origination_date
+    dtype: datetime
+
+  - name: maturity_date
+    dtype: datetime
+
+  - name: collateral_items
+    dtype: nested
+    entity_ref: CollateralItem
