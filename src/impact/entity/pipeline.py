@@ -16,13 +16,14 @@ import pandas as pd
 
 from impact.common.exceptions import ConfigError, SourceError, TransformError, ValidationError
 from impact.common.logging import get_logger
+from impact.common.utils import cast_and_fill, strip_source_prefixes
 from impact.entity.config.parser import ConfigParser
-from impact.entity.config.schema import EntityConfig, FieldConfig, SourceConfig, TransformConfig
+from impact.entity.config.schema import EntityConfig
 from impact.entity.join.engine import JoinEngine
 from impact.entity.model.builder import EntityBuilder
-from impact.entity.sub_entity import SubEntityProcessor, resolve_sub_entity_config
+from impact.entity.sub_entity import process_sub_entity_fields
 from impact.entity.transform.builtin import CastTransformer
-from impact.entity.validate.base import ValidationReport, ValidationResult
+from impact.entity.validate.base import ValidationReport
 
 # Import builtins to trigger decorator registration
 import impact.entity.source.csv_excel  # noqa: F401
@@ -164,7 +165,9 @@ class EntityPipeline:
             logger.warning("Validation completed with %d warnings", report.warning_count)
 
         # 4b. Process sub-entities (nested fields with entity_ref)
-        sub_entity_classes = self._process_sub_entities(result_df, report)
+        sub_entity_classes = process_sub_entity_fields(
+            self.config.fields, result_df, report, self.config_path
+        )
 
         # 5. Drop temp fields, then build entity class and instances
         logger.info("Stage 5/5: Building entity class and instances")
@@ -285,12 +288,18 @@ class EntityPipeline:
         result = df.copy()
         source_prefixes = {s.name for s in self.config.sources}
 
+        # Pre-compute stripped sources (avoids re-sorting per field)
+        stripped_map = {
+            f.name: strip_source_prefixes(f.source, source_prefixes)
+            for f in self.config.fields if f.source is not None
+        }
+
         # Batch renames first (avoids N DataFrame copies)
         rename_map: dict[str, str] = {}
         for field in self.config.fields:
             if field.source is None:
                 continue
-            stripped = self._strip_source_prefixes(field.source, source_prefixes)
+            stripped = stripped_map[field.name]
             if stripped.isidentifier() and stripped != field.name:
                 if stripped not in result.columns:
                     raise TransformError(
@@ -303,11 +312,10 @@ class EntityPipeline:
                 logger.info("  Field '%s': renamed from '%s'", new, old)
 
         # Per source field: expression eval → cast → fill_na
-        caster = self._caster
         for field in self.config.fields:
             if field.source is None:
                 continue
-            stripped = self._strip_source_prefixes(field.source, source_prefixes)
+            stripped = stripped_map[field.name]
 
             if not stripped.isidentifier():
                 # Source is an expression — evaluate it
@@ -320,7 +328,7 @@ class EntityPipeline:
                     ) from exc
                 logger.info("  Field '%s': computed from source expression", field.name)
 
-            result = self._cast_and_fill(result, field, caster)
+            result = cast_and_fill(result, field.name, field.dtype, field.fill_na, self._caster)
 
         return result
 
@@ -349,81 +357,9 @@ class EntityPipeline:
                     f"'{field.derived}': {exc}"
                 ) from exc
             logger.info("  Field '%s': derived from expression", field.name)
-            result = self._cast_and_fill(result, field, caster)
+            result = cast_and_fill(result, field.name, field.dtype, field.fill_na, self._caster)
 
         return result
-
-    @staticmethod
-    def _cast_and_fill(df: pd.DataFrame, field: FieldConfig, caster: CastTransformer) -> pd.DataFrame:
-        """Apply dtype cast then fill_na for a single field."""
-        if field.dtype != "nested" and field.name in df.columns:
-            try:
-                cast_cfg = TransformConfig(type="cast", columns={field.name: field.dtype})
-                df = caster.apply(df, cast_cfg)
-            except Exception as exc:
-                raise TransformError(
-                    f"Field '{field.name}': auto-cast to '{field.dtype}' failed: {exc}"
-                ) from exc
-        if field.fill_na is not None and field.name in df.columns:
-            df[field.name] = df[field.name].fillna(field.fill_na)
-            logger.info("  Field '%s': filled NA with %r", field.name, field.fill_na)
-        return df
-
-    @staticmethod
-    def _strip_source_prefixes(expr: str, source_names: set[str]) -> str:
-        """Strip known source-name prefixes from an expression or column reference.
-
-        Sorts source names longest-first so that ``"other_facility."`` is stripped
-        before ``"facility."`` — avoiding partial substring matches.
-        """
-        for src in sorted(source_names, key=len, reverse=True):
-            expr = expr.replace(f"{src}.", "")
-        return expr
-
-    def _process_sub_entities(
-        self, df: pd.DataFrame, report: ValidationReport
-    ) -> dict[str, type]:
-        """Process nested fields with entity_ref through sub-entity pipelines.
-
-        For each field with ``dtype: nested`` and ``entity_ref`` set, resolves the
-        sub-entity config and processes each cell's nested DataFrame through
-        ``SubEntityProcessor``. Replaces the nested DataFrame cells with lists of
-        sub-entity instances and merges sub-entity validation results into the
-        parent report.
-
-        Returns:
-            Mapping of field name → sub-entity class.
-        """
-        sub_entity_classes: dict[str, type] = {}
-        nested_fields = [
-            f for f in self.config.fields
-            if f.dtype == "nested" and f.entity_ref is not None
-        ]
-
-        if not nested_fields:
-            return sub_entity_classes
-
-        for field in nested_fields:
-            logger.info("  Processing sub-entity '%s' for field '%s'", field.entity_ref, field.name)
-            sub_config = resolve_sub_entity_config(field.entity_ref, self.config_path)
-            processor = SubEntityProcessor(sub_config, config_path=self.config_path)
-
-            entity_lists: list[list] = []
-            for idx, cell in enumerate(df[field.name]):
-                nested_df = cell if isinstance(cell, pd.DataFrame) else pd.DataFrame()
-                result = processor.process(nested_df)
-                entity_lists.append(result.entities)
-                report.results.extend(result.validation_report.results)
-
-                if idx == 0:
-                    sub_entity_classes[field.name] = result.entity_class
-
-            df[field.name] = entity_lists
-            logger.info(
-                "  Sub-entity '%s': processed %d cells", field.entity_ref, len(entity_lists)
-            )
-
-        return sub_entity_classes
 
     def _run_field_validations(
         self, df: pd.DataFrame, pass_filter: str | None = None
