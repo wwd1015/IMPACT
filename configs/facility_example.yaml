@@ -3,29 +3,35 @@ entity:
   description: "Commercial lending facility entity"
   version: "1.0"
 
+# ---------------------------------------------------------------------------
+# Global parameters — default values shared across all sources and filters.
+# The orchestration layer (Airflow, CLI, etc.) overrides these at runtime via
+# pipeline.run(parameters={...}). Source-level parameters override these for
+# that source only. Priority: runtime > source-level > global default.
+# ---------------------------------------------------------------------------
+parameters:
+  snapshot_date: "2025-12-31"            # override at runtime: pipeline.run(parameters={"snapshot_date": "..."})
+  active_status: "ACTIVE"        # override per run: pipeline.run(parameters={"active_status": "PENDING"})
+
 sources:
   - name: facility_main
     type: snowflake
     primary: true
     connection:
-      account: "${SNOWFLAKE_ACCOUNT}"
+      account: "${SNOWFLAKE_ACCOUNT}"          # resolved from env var: export SNOWFLAKE_ACCOUNT=myorg-myaccount
       database: CREDIT_DB
       schema: LENDING
-      warehouse: ANALYTICS_WH
+      warehouse: "${SNOWFLAKE_WH:ANALYTICS_WH}"  # resolved from env var; falls back to ANALYTICS_WH if unset
     query: |
       SELECT facility_id, obligor_id, product_type,
              commitment_amount, outstanding_balance,
              origination_date, maturity_date, interest_rate
       FROM facility_master
-      WHERE snapshot_date = :snapshot_date
-    parameters:
-      snapshot_date: "2025-12-31"
+      WHERE snapshot_date = :snapshot_date    -- bound from parameters.snapshot_date
 
   - name: collateral
     type: parquet
-    path: "data/collateral/{snapshot_date}/*.parquet"
-    parameters:
-      snapshot_date: "2025-12-31"
+    path: "data/collateral/{snapshot_date}/*.parquet"   # {snapshot_date} interpolated from parameters
 
   - name: rating_overrides
     type: csv
@@ -48,84 +54,177 @@ joins:
     right: rating_overrides
     how: left
     on:
+      # Multiple join keys: each entry is one key pair. All must match (AND logic).
       - left_col: facility_id
         right_col: facility_id
+      - left_col: product_type
+        right_col: product_type
     relationship: one_to_one
 
-transforms:
-  - type: cast
-    columns:
-      commitment_amount: float64
-      outstanding_balance: float64
-      interest_rate: float64
-      origination_date: datetime
-      maturity_date: datetime
-
-  - type: derive
-    name: utilization_rate
-    expression: "outstanding_balance / commitment_amount"
-    dtype: float64
-
-  - type: rename
-    mapping:
-      product_type: product_category
-
-  - type: fill_na
-    strategy:
-      interest_rate: 0.0
-      product_category: "UNKNOWN"
-
-validations:
-  - type: not_null
-    columns: [facility_id, obligor_id, commitment_amount]
-    severity: error
-
-  - type: unique
-    columns: [facility_id]
-    severity: error
-
-  - type: range
-    column: interest_rate
-    min: 0.0
-    max: 1.0
-    severity: warning
-
-  - type: expression
-    rule: "outstanding_balance <= commitment_amount"
-    message: "Outstanding cannot exceed commitment"
-    severity: warning
+# ---------------------------------------------------------------------------
+# Row filters — applied after all field processing (Pass 1 + Pass 2).
+# Each entry is a pandas eval expression evaluated in order.
+# Use @param_name to reference a runtime parameter (e.g. status == @active_status).
+# Static data-quality gates go here; source-level filtering belongs in the SQL query.
+# ---------------------------------------------------------------------------
+filters:
+  - "commitment_amount > 0"                # static data-quality gate
+  - "status == @active_status"             # parameterized — value injected at runtime from parameters.active_status
+  # Multiple conditions: use 'and' / 'or' with parentheses for grouping, same as Python.
+  # Each filter is a separate pandas eval expression — multiple entries are AND-ed together
+  # (each row must pass all filters). Use a single entry with 'or'/'and' for OR logic:
+  #   - "commitment_amount > 0 and (product_category == 'TERM_LOAN' or product_category == 'REVOLVER')"
 
 fields:
+  # ---------------------------------------------------------------------------
+  # Field definition reference
+  #
+  # REQUIRED for every field:
+  #   source OR derived  — data origin (mutually exclusive, pick one)
+  #   dtype              — target data type; cast is applied before fill_na
+  #
+  # OPTIONAL:
+  #   fill_na            — scalar fill value applied after dtype cast
+  #   description        — human-readable label
+  #   primary_key        — marks the entity primary key (default: false)
+  #   entity_ref         — sub-entity type name (nested dtype only)
+  #   temp               — if true, used during processing but dropped from entity class
+  #   validation_type    — list of checks: not_null, unique, range, expression, custom
+  #   validation_rule    — rules keyed by type (required for range and expression)
+  #     range: [min, max]           use null for unbounded, e.g. [0, null]
+  #     expression: "<pandas expr>"  boolean expression evaluated against the full DataFrame
+  #   validation_severity — per-type severity override (default: warning)
+  #     <type>: error               error halts the pipeline; warning logs and continues
+  #
+  # Data origin:
+  #   source: col_name              pass-through (primary source — no prefix needed)
+  #   source: src_name.col_name     pass-through or rename (non-primary source)
+  #   source: "expr"                expression evaluated in Pass 1; src_name. prefix stripped
+  #   derived: "expr"               expression evaluated in Pass 2, after all source fields
+  #                                 are processed; use field names only — no src prefix needed
+  #   derived: "lambda row: ..."    row-wise Python lambda (full row context)
+  #
+  # Processing order:
+  #   Pass 1 — source:  rename/expression → cast → fill_na → source field validations
+  #   Pass 2 — derived: eval → cast → fill_na → derived field validations
+  #   Filters applied after Pass 2
+  # ---------------------------------------------------------------------------
+
+  # ===========================================================================
+  # PASS 1 — SOURCE FIELDS
+  # Loaded directly from source data. Processed first: rename/expr → cast → fill_na → validate.
+  # ===========================================================================
+
   - name: facility_id
+    source: facility_id
     dtype: str
     description: "Unique facility identifier"
     primary_key: true
+    validation_type: [not_null, unique]
+    validation_severity:
+      not_null: error
+      unique: error
 
   - name: obligor_id
+    source: obligor_id
     dtype: str
     description: "FK to obligor entity"
+    validation_type: [not_null]
+    validation_severity:
+      not_null: error
 
   - name: product_category
+    source: product_type           # rename: product_type → product_category
     dtype: str
+    fill_na: "UNKNOWN"
 
   - name: commitment_amount
+    source: commitment_amount
     dtype: float64
+    validation_type: [not_null, range]
+    validation_rule:
+      range: [0, null]             # min=0, no upper bound
+    validation_severity:
+      not_null: error
 
   - name: outstanding_balance
-    dtype: float64
-
-  - name: utilization_rate
+    source: outstanding_balance
     dtype: float64
 
   - name: interest_rate
+    source: interest_rate
     dtype: float64
+    fill_na: 0.0
+    validation_type: [range]
+    validation_rule:
+      range: [0.0, 1.0]
+    validation_severity:
+      range: warning
 
   - name: origination_date
+    source: origination_date
     dtype: datetime
 
   - name: maturity_date
+    source: maturity_date
     dtype: datetime
 
+  - name: rating_override
+    source: rating_overrides.rating_override   # non-primary source: src_name.col required
+    dtype: str
+    description: "Manual rating override from ops team (nullable)"
+
   - name: collateral_items
-    dtype: nested
-    entity_ref: CollateralItem
+    source: collateral_items                   # join engine output column (nested_as: collateral_items)
+    dtype: nested                              # pd.DataFrame per row; no cast applied
+    entity_ref: CollateralItem                 # entity_ref: names the sub-entity type stored in this nested column.
+                                               # Used for documentation and future typed-access support.
+                                               # The value must match the entity.name of the sub-entity's own YAML config.
+    description: "One-to-many collateral positions (nested DataFrame)"
+
+  - name: available_capacity
+    source: "facility_main.commitment_amount - facility_main.outstanding_balance"
+    dtype: float64
+    description: "Undrawn commitment capacity"
+    temp: true                     # intermediate — used by derived fields, not on entity class
+
+  # ===========================================================================
+  # PASS 2 — DERIVED FIELDS
+  # Computed after all source fields are renamed, cast, filled, and validated.
+  # Reference field names only — no src_name prefix needed or expected.
+  # ===========================================================================
+
+  - name: utilization_rate
+    derived: "outstanding_balance / commitment_amount"
+    dtype: float64
+    description: "Outstanding balance as a fraction of commitment"
+    validation_type: [range, expression]
+    validation_rule:
+      range: [0.0, 1.0]
+      expression: "outstanding_balance <= commitment_amount"
+    validation_severity:
+      range: warning
+      expression: warning
+
+  - name: capacity_utilization
+    derived: "1 - available_capacity / commitment_amount"
+    dtype: float64
+    description: "Fraction of commitment capacity consumed"
+
+  - name: total_collateral_value
+    derived: "lambda row: row['collateral_items']['collateral_value'].sum() if not row['collateral_items'].empty else 0.0"
+    dtype: float64
+    description: "Sum of collateral_value across all collateral positions for this facility"
+    # Lambda receives the full entity row as a pandas Series.
+    # row['collateral_items'] is always a pd.DataFrame (guaranteed by the join engine) —
+    # facilities with no matching collateral get an empty DataFrame, hence the .empty guard.
+
+  - name: days_to_maturity
+    derived: "lambda row: (row['maturity_date'] - row['origination_date']).days"
+    dtype: int64
+    description: "Total term length in days"
+    validation_type: [range]
+    validation_rule:
+      range: [0, null]
+    validation_severity:
+      range: error

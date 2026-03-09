@@ -20,10 +20,10 @@ def builder():
 @pytest.fixture
 def basic_fields():
     return [
-        FieldConfig(name="id", dtype="str", primary_key=True),
-        FieldConfig(name="amount", dtype="float64"),
-        FieldConfig(name="name", dtype="str"),
-        FieldConfig(name="active", dtype="bool"),
+        FieldConfig(name="id", source="id", dtype="str", primary_key=True),
+        FieldConfig(name="amount", source="amount", dtype="float64"),
+        FieldConfig(name="name", source="name", dtype="str"),
+        FieldConfig(name="active", source="active", dtype="bool"),
     ]
 
 
@@ -59,14 +59,14 @@ class TestEntityBuilder:
         assert obj.active is None
 
     def test_build_class_unknown_dtype(self, builder):
-        fields = [FieldConfig(name="x", dtype="unknown_type")]
+        fields = [FieldConfig(name="x", source="x", dtype="unknown_type")]
         with pytest.raises(EntityBuildError, match="Unknown dtype"):
             builder.build_class("Bad", fields)
 
     def test_nested_field(self, builder):
         fields = [
-            FieldConfig(name="id", dtype="str", primary_key=True),
-            FieldConfig(name="items", dtype="nested"),
+            FieldConfig(name="id", source="id", dtype="str", primary_key=True),
+            FieldConfig(name="items", source="items", dtype="nested"),
         ]
         cls = builder.build_class("Parent", fields)
         nested_df = pd.DataFrame({"col": [1, 2]})
@@ -107,8 +107,8 @@ class TestToEntities:
 
     def test_to_entities_with_nested_df(self, builder):
         fields = [
-            FieldConfig(name="id", dtype="str", primary_key=True),
-            FieldConfig(name="children", dtype="nested"),
+            FieldConfig(name="id", source="id", dtype="str", primary_key=True),
+            FieldConfig(name="children", source="children", dtype="nested"),
         ]
         cls = builder.build_class("Parent", fields)
 

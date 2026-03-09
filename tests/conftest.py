@@ -89,8 +89,8 @@ def minimal_config_dict() -> dict:
             }
         ],
         "fields": [
-            {"name": "id", "dtype": "str", "primary_key": True},
-            {"name": "value", "dtype": "float64"},
+            {"name": "id", "source": "id", "dtype": "str", "primary_key": True},
+            {"name": "value", "source": "value", "dtype": "float64"},
         ],
     }
 
@@ -148,58 +148,56 @@ def full_config_dict(tmp_dir) -> dict:
                 "nested_as": "collateral_items",
             }
         ],
-        "transforms": [
+        "fields": [
             {
-                "type": "cast",
-                "columns": {
-                    "commitment_amount": "float64",
-                    "outstanding_balance": "float64",
-                    "interest_rate": "float64",
-                },
+                "name": "facility_id",
+                "source": "facility_id",
+                "dtype": "str",
+                "primary_key": True,
+                "validation_type": ["not_null", "unique"],
+                "validation_severity": {"not_null": "error", "unique": "error"},
             },
             {
-                "type": "derive",
-                "name": "utilization_rate",
-                "expression": "outstanding_balance / commitment_amount",
+                "name": "obligor_id",
+                "source": "obligor_id",
+                "dtype": "str",
+                "validation_type": ["not_null"],
+                "validation_severity": {"not_null": "error"},
+            },
+            {
+                "name": "product_category",
+                "source": "product_type",
+                "dtype": "str",
+            },
+            {
+                "name": "commitment_amount",
+                "source": "commitment_amount",
                 "dtype": "float64",
             },
             {
-                "type": "rename",
-                "mapping": {"product_type": "product_category"},
+                "name": "outstanding_balance",
+                "source": "outstanding_balance",
+                "dtype": "float64",
             },
             {
-                "type": "fill_na",
-                "strategy": {"interest_rate": 0.0},
-            },
-        ],
-        "validations": [
-            {
-                "type": "not_null",
-                "columns": ["facility_id", "obligor_id"],
-                "severity": "error",
+                "name": "interest_rate",
+                "source": "interest_rate",
+                "dtype": "float64",
+                "fill_na": 0.0,
+                "validation_type": ["range"],
+                "validation_rule": {"range": [0.0, 1.0]},
+                "validation_severity": {"range": "warning"},
             },
             {
-                "type": "unique",
-                "columns": ["facility_id"],
-                "severity": "error",
+                "name": "collateral_items",
+                "source": "collateral_items",
+                "dtype": "nested",
             },
             {
-                "type": "range",
-                "column": "interest_rate",
-                "min": 0.0,
-                "max": 1.0,
-                "severity": "warning",
+                "name": "utilization_rate",
+                "derived": "outstanding_balance / commitment_amount",
+                "dtype": "float64",
             },
-        ],
-        "fields": [
-            {"name": "facility_id", "dtype": "str", "primary_key": True},
-            {"name": "obligor_id", "dtype": "str"},
-            {"name": "product_category", "dtype": "str"},
-            {"name": "commitment_amount", "dtype": "float64"},
-            {"name": "outstanding_balance", "dtype": "float64"},
-            {"name": "utilization_rate", "dtype": "float64"},
-            {"name": "interest_rate", "dtype": "float64"},
-            {"name": "collateral_items", "dtype": "nested"},
         ],
     }
 

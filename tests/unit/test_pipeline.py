@@ -75,8 +75,8 @@ class TestEntityPipeline:
 
     def test_pipeline_validation_error_halts(self, tmp_dir, full_config_dict):
         """Pipeline should raise ValidationError when severity=error validation fails."""
-        # Add a validation that will fail
-        full_config_dict["validations"].append(
+        # Add a global validation that will fail
+        full_config_dict.setdefault("validations", []).append(
             {
                 "type": "expression",
                 "rule": "commitment_amount > 9999999",  # No facility has this
@@ -104,8 +104,8 @@ class TestPipelineWithoutOptionalSteps:
             "entity": {"name": "Simple"},
             "sources": [{"name": "main", "type": "csv", "primary": True, "path": str(csv_path)}],
             "fields": [
-                {"name": "id", "dtype": "str", "primary_key": True},
-                {"name": "val", "dtype": "float64"},
+                {"name": "id", "source": "id", "dtype": "str", "primary_key": True},
+                {"name": "val", "source": "val", "dtype": "float64"},
             ],
         }
         config = EntityConfig.model_validate(config_dict)
@@ -121,8 +121,8 @@ class TestPipelineWithoutOptionalSteps:
             "entity": {"name": "Minimal"},
             "sources": [{"name": "src", "type": "csv", "primary": True, "path": str(csv_path)}],
             "fields": [
-                {"name": "id", "dtype": "str", "primary_key": True},
-                {"name": "name", "dtype": "str"},
+                {"name": "id", "source": "id", "dtype": "str", "primary_key": True},
+                {"name": "name", "source": "name", "dtype": "str"},
             ],
         }
         config = EntityConfig.model_validate(config_dict)

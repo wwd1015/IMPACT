@@ -5,12 +5,12 @@ Includes: cast, rename, derive, fill_na, drop, filter, custom.
 
 from __future__ import annotations
 
-import importlib
 from typing import Any
 
 import pandas as pd
 
 from impact.common.exceptions import TransformError
+from impact.common.utils import import_dotted_path
 from impact.common.logging import get_logger
 from impact.entity.config.schema import TransformConfig
 from impact.entity.transform.base import Transformer
@@ -261,18 +261,4 @@ class CustomTransformer(Transformer):
 
     @staticmethod
     def _import_function(dotted_path: str):
-        """Dynamically import a function from a dotted module path."""
-        parts = dotted_path.rsplit(".", 1)
-        if len(parts) != 2:
-            raise TransformError(
-                f"Invalid function path '{dotted_path}'. "
-                "Expected format: 'module.path.function_name'"
-            )
-        module_path, func_name = parts
-        try:
-            module = importlib.import_module(module_path)
-            return getattr(module, func_name)
-        except (ImportError, AttributeError) as exc:
-            raise TransformError(
-                f"Cannot import function '{dotted_path}': {exc}"
-            ) from exc
+        return import_dotted_path(dotted_path, error_class=TransformError)

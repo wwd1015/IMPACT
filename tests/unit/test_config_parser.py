@@ -89,8 +89,6 @@ class TestConfigSchema:
         assert config.entity.name == "Facility"
         assert len(config.sources) == 2
         assert len(config.joins) == 1
-        assert len(config.transforms) == 4
-        assert len(config.validations) == 3
         assert len(config.fields) == 8
 
 

@@ -9,6 +9,9 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
+# Reusable type alias — kept in sync with ValidationConfig.type
+ValidationTypeLiteral = Literal["not_null", "unique", "range", "expression", "custom"]
+
 from pydantic import BaseModel, Field, model_validator
 
 
@@ -159,9 +162,7 @@ class TransformConfig(BaseModel):
 class ValidationConfig(BaseModel):
     """Configuration for a single validation rule."""
 
-    type: Literal["not_null", "unique", "range", "expression", "custom"] = Field(
-        ..., description="Validation type"
-    )
+    type: ValidationTypeLiteral = Field(..., description="Validation type")
     severity: Literal["error", "warning"] = Field(
         "error", description="error = halt pipeline; warning = log and continue"
     )
@@ -184,10 +185,34 @@ class ValidationConfig(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# Field configs (= entity class definition)
+# Field configs (= entity class definition + inline transforms + validations)
 # ---------------------------------------------------------------------------
 class FieldConfig(BaseModel):
-    """Definition of a single field on the entity class."""
+    """Definition of a single field on the entity class.
+
+    A field can optionally declare its own data origin, transformation, and
+    validation rules inline, consolidating what would otherwise be spread
+    across the top-level ``transforms`` and ``validations`` sections.
+
+    Data origin (mutually exclusive):
+    - ``source``: map/rename an existing column (e.g. ``"product_type"`` or
+      ``"facility_main.product_type"``).  The source-prefix notation is
+      informational; only the column name after the last ``.`` is used.
+    - ``derived``: compute this column from a pandas expression
+      (e.g. ``"outstanding_balance / commitment_amount"``).
+
+    Inline transforms:
+    - ``fill_na``: scalar fill value applied after source/derived resolution.
+      Omit (or set to ``null``) to skip.
+
+    Inline validations (compact format):
+    - ``validation_type``: list of types — ``not_null``, ``unique``, ``range``,
+      ``expression``, ``custom``.
+    - ``validation_rule``: dict of rules keyed by type (required for ``range``
+      and ``expression``; omit for ``not_null`` and ``unique``).
+    - ``validation_severity``: dict of severity overrides keyed by type.
+      Default is ``"warning"``; use ``"error"`` to halt the pipeline.
+    """
 
     name: str = Field(..., description="Field / column name")
     dtype: str = Field(..., description="Data type: str, int32, int64, float64, datetime, bool, nested")
@@ -196,6 +221,138 @@ class FieldConfig(BaseModel):
     entity_ref: str | None = Field(
         None, description="Reference to another entity config (for nested fields)"
     )
+
+    # --- Data origin (mutually exclusive) ---
+    source: str | None = Field(
+        None,
+        description=(
+            "Processed in Pass 1 (with all other source fields). Two forms:\n"
+            "  Column reference: 'col' or 'src_name.col' — pass-through or rename.\n"
+            "  Expression: 'src_name.col_a + src_name.col_b' — evaluated via df.eval();\n"
+            "    source-name prefixes are stripped automatically before evaluation."
+        ),
+    )
+    derived: str | None = Field(
+        None,
+        description=(
+            "Processed in Pass 2, after all source fields are fully processed "
+            "(renamed, cast, filled, validated). Use field names only — no src_name prefix.\n"
+            "  pandas expression: 'col_a / col_b'\n"
+            "  row-wise lambda:   'lambda row: row[\"a\"] * 2'"
+        ),
+    )
+
+    # --- Inline transforms ---
+    fill_na: Any = Field(
+        None,
+        description="Scalar value to fill NAs after dtype cast. Omit to skip.",
+    )
+
+    # --- Temp flag ---
+    temp: bool = Field(
+        False,
+        description=(
+            "If true, the field is available throughout processing (transforms, validations) "
+            "but is dropped before the entity class is built. Use for intermediate calculations."
+        ),
+    )
+
+    # --- Inline validations (compact format) ---
+    validation_type: list[ValidationTypeLiteral] | None = Field(
+        None,
+        description=(
+            "List of validation types to apply to this field. "
+            "Supported: not_null, unique, range, expression, custom."
+        ),
+    )
+    validation_rule: dict[str, Any] | None = Field(
+        None,
+        description=(
+            "Rules keyed by validation type. Required for 'range' ([min, max] or {min, max}) "
+            "and 'expression' (rule string). Omit for not_null and unique."
+        ),
+    )
+    validation_severity: dict[str, str] | None = Field(
+        None,
+        description=(
+            "Severity overrides keyed by validation type. "
+            "Default severity is 'warning'. Use 'error' to halt the pipeline."
+        ),
+    )
+
+    @model_validator(mode="after")
+    def validate_source_and_derived(self) -> FieldConfig:
+        if self.source is not None and self.derived is not None:
+            raise ValueError(
+                f"Field '{self.name}': 'source' and 'derived' are mutually exclusive."
+            )
+        if self.source is None and self.derived is None:
+            raise ValueError(
+                f"Field '{self.name}': exactly one of 'source' or 'derived' is required."
+            )
+        return self
+
+    def build_validation_configs(self, pass_filter: str | None = None) -> list[ValidationConfig]:
+        """Expand compact field-level validation syntax into ValidationConfig objects.
+
+        Args:
+            pass_filter: ``"source"`` to return configs only for source fields,
+                ``"derived"`` for derived fields, or ``None`` for all fields.
+
+        Rule conventions by type:
+        - ``not_null`` / ``unique``: no rule needed; column = this field.
+        - ``range``: ``validation_rule.range`` is ``[min, max]`` or ``{min, max}``.
+        - ``expression``: ``validation_rule.expression`` is a pandas-eval boolean string.
+        - ``custom``: ``validation_rule.custom`` is a dotted function path.
+
+        Default severity is ``"warning"`` unless overridden in ``validation_severity``.
+        """
+        if not self.validation_type:
+            return []
+
+        rules = self.validation_rule or {}
+        severities = self.validation_severity or {}
+        configs: list[ValidationConfig] = []
+
+        for vtype in self.validation_type:
+            severity = severities.get(vtype, "warning")
+            common: dict[str, Any] = {"type": vtype, "severity": severity}
+
+            if vtype in ("not_null", "unique"):
+                configs.append(ValidationConfig(**common, columns=[self.name]))
+
+            elif vtype == "range":
+                raw = rules.get("range")
+                if raw is None:
+                    raise ValueError(
+                        f"Field '{self.name}': validation_type 'range' requires "
+                        "'range' key in validation_rule (e.g. [0.0, 1.0])"
+                    )
+                if isinstance(raw, (list, tuple)):
+                    lo, hi = raw[0], raw[1]
+                else:
+                    lo, hi = raw.get("min"), raw.get("max")
+                configs.append(ValidationConfig(**common, column=self.name, min=lo, max=hi))
+
+            elif vtype == "expression":
+                rule_str = rules.get("expression")
+                if rule_str is None:
+                    raise ValueError(
+                        f"Field '{self.name}': validation_type 'expression' requires "
+                        "'expression' key in validation_rule"
+                    )
+                configs.append(ValidationConfig(**common, rule=rule_str, message=rule_str))
+
+            elif vtype == "custom":
+                fn = rules.get("custom")
+                if fn is None:
+                    raise ValueError(
+                        f"Field '{self.name}': validation_type 'custom' requires "
+                        "'custom' key in validation_rule (dotted function path)"
+                    )
+                configs.append(ValidationConfig(**common, function=fn))
+
+        return configs
 
 
 # ---------------------------------------------------------------------------
@@ -208,9 +365,26 @@ class EntityConfig(BaseModel):
     """
 
     entity: EntityMeta
+    parameters: dict[str, Any] = Field(
+        default_factory=dict,
+        description=(
+            "Global default parameters. Applied to all sources and filters. "
+            "Source-level parameters override these; runtime parameters passed to "
+            "pipeline.run() override both. Use for values like snapshot_date that "
+            "are shared across sources."
+        ),
+    )
     sources: list[SourceConfig]
     joins: list[JoinConfig] | None = None
-    transforms: list[TransformConfig] | None = None
+    filters: list[str] | None = Field(
+        None,
+        description=(
+            "Row-level filter conditions applied after all field processing. "
+            "Each entry is a pandas eval expression (e.g. 'commitment_amount > 0'). "
+            "Use @param_name syntax to reference runtime parameters "
+            "(e.g. 'status == @active_status')."
+        ),
+    )
     validations: list[ValidationConfig] | None = None
     fields: list[FieldConfig]
 

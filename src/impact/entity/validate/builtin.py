@@ -5,11 +5,10 @@ Includes: not_null, unique, range, expression, custom.
 
 from __future__ import annotations
 
-import importlib
-
 import pandas as pd
 
 from impact.common.logging import get_logger
+from impact.common.utils import import_dotted_path
 from impact.entity.config.schema import ValidationConfig
 from impact.entity.validate.base import ValidationResult, Validator
 from impact.entity.validate.registry import ValidatorRegistry
@@ -206,13 +205,5 @@ class CustomValidator(Validator):
 
     @staticmethod
     def _import_function(dotted_path: str):
-        """Dynamically import a function from a dotted module path."""
-        parts = dotted_path.rsplit(".", 1)
-        if len(parts) != 2:
-            raise ValueError(
-                f"Invalid function path '{dotted_path}'. "
-                "Expected format: 'module.path.function_name'"
-            )
-        module_path, func_name = parts
-        module = importlib.import_module(module_path)
-        return getattr(module, func_name)
+        from impact.common.exceptions import ValidationError
+        return import_dotted_path(dotted_path, error_class=ValidationError)

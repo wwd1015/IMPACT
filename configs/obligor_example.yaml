@@ -3,6 +3,15 @@ entity:
   description: "Lending obligor (borrower) entity"
   version: "1.0"
 
+# ---------------------------------------------------------------------------
+# Global parameters — default values shared across all sources and filters.
+# The orchestration layer (Airflow, CLI, etc.) overrides these at runtime via
+# pipeline.run(parameters={...}). Source-level parameters override these for
+# that source only. Priority: runtime > source-level > global default.
+# ---------------------------------------------------------------------------
+parameters:
+  year: "2025"    # override per run: pipeline.run(parameters={"year": "2026"})
+
 sources:
   - name: obligor_main
     type: csv
@@ -13,9 +22,7 @@ sources:
 
   - name: financial_statements
     type: parquet
-    path: "data/financials/{year}/*.parquet"
-    parameters:
-      year: "2025"
+    path: "data/financials/{year}/*.parquet"   # {year} interpolated from parameters
 
 joins:
   - left: obligor_main
@@ -27,64 +34,93 @@ joins:
     relationship: one_to_many
     nested_as: financials
 
-transforms:
-  - type: cast
-    columns:
-      revenue: float64
-      total_assets: float64
-      total_liabilities: float64
-      founded_date: datetime
-
-  - type: derive
-    name: debt_to_asset_ratio
-    expression: "total_liabilities / total_assets"
-    dtype: float64
-
-  - type: fill_na
-    strategy:
-      industry: "UNKNOWN"
-      country: "US"
-
-validations:
-  - type: not_null
-    columns: [obligor_id, legal_name]
-    severity: error
-
-  - type: unique
-    columns: [obligor_id]
-    severity: error
+# ---------------------------------------------------------------------------
+# Row filters — applied after all field processing (Pass 1 + Pass 2).
+# Each entry is a pandas eval expression evaluated in order.
+# Use @param_name to reference a runtime parameter (e.g. status == @active_status).
+# Static data-quality gates go here; source-level filtering belongs in the SQL query.
+# ---------------------------------------------------------------------------
+filters:
+  - "total_assets > 0"
 
 fields:
+  # ===========================================================================
+  # PASS 1 — SOURCE FIELDS
+  # Loaded directly from source data. Processed first: rename/expr → cast → fill_na → validate.
+  # ===========================================================================
+
   - name: obligor_id
+    source: obligor_id
     dtype: str
     description: "Unique obligor identifier"
     primary_key: true
+    validation_type: [not_null, unique]
+    validation_severity:
+      not_null: error
+      unique: error
 
   - name: legal_name
+    source: legal_name
     dtype: str
     description: "Legal name of the obligor"
+    validation_type: [not_null]
+    validation_severity:
+      not_null: error
 
   - name: industry
+    source: industry
     dtype: str
+    fill_na: "UNKNOWN"
 
   - name: country
+    source: country
     dtype: str
+    fill_na: "US"
 
   - name: revenue
+    source: revenue
     dtype: float64
+    validation_type: [range]
+    validation_rule:
+      range: [0, null]               # revenue must be non-negative
+    validation_severity:
+      range: warning
 
   - name: total_assets
+    source: total_assets
     dtype: float64
 
   - name: total_liabilities
-    dtype: float64
-
-  - name: debt_to_asset_ratio
+    source: total_liabilities
     dtype: float64
 
   - name: founded_date
+    source: founded_date
     dtype: datetime
 
   - name: financials
+    source: financial_statements.financials   # non-primary source: nested join result
     dtype: nested
     entity_ref: FinancialStatement
+    description: "One-to-many financial statement records (nested DataFrame)"
+
+  # ===========================================================================
+  # PASS 2 — DERIVED FIELDS
+  # Computed after all source fields are renamed, cast, filled, and validated.
+  # Reference field names only — no src_name prefix needed or expected.
+  # ===========================================================================
+
+  - name: debt_to_asset_ratio
+    derived: "total_liabilities / total_assets"
+    dtype: float64
+    description: "Total liabilities divided by total assets"
+    validation_type: [range]
+    validation_rule:
+      range: [0.0, 10.0]            # flag extreme leverage
+    validation_severity:
+      range: warning
+
+  - name: leverage_flag
+    derived: "lambda row: 'HIGH' if row['total_liabilities'] > row['total_assets'] else 'NORMAL'"
+    dtype: str
+    description: "HIGH when liabilities exceed assets, else NORMAL"

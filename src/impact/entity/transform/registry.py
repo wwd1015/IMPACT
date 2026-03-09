@@ -23,6 +23,7 @@ class TransformRegistry:
     """
 
     _registry: dict[str, type[Transformer]] = {}
+    _instances: dict[str, Transformer] = {}
 
     @classmethod
     def register(cls, transform_type: str):
@@ -34,25 +35,26 @@ class TransformRegistry:
 
         def wrapper(transformer_cls: type[Transformer]):
             cls._registry[transform_type] = transformer_cls
+            cls._instances[transform_type] = transformer_cls()
             return transformer_cls
 
         return wrapper
 
     @classmethod
     def get(cls, transform_type: str) -> Transformer:
-        """Instantiate and return a transformer for the given type.
+        """Return the singleton transformer instance for the given type.
 
         Raises:
             TransformError: If no transformer is registered for the type.
         """
-        transformer_cls = cls._registry.get(transform_type)
-        if transformer_cls is None:
+        instance = cls._instances.get(transform_type)
+        if instance is None:
             available = ", ".join(sorted(cls._registry.keys()))
             raise TransformError(
                 f"No transformer registered for type '{transform_type}'. "
                 f"Available: {available}"
             )
-        return transformer_cls()
+        return instance
 
     @classmethod
     def available_types(cls) -> list[str]:
