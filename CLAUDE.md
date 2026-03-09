@@ -13,7 +13,7 @@ python3 -m pytest tests/ -v    # Run tests
 
 ## Architecture
 
-The Entity Data Module follows a **5-stage pipeline**: Load → Join → Transform → Filter → Validate → Build.
+The Entity Data Module follows a **5-stage pipeline**: Load → Join → Transform (+ Filter) → Validate → Build.
 
 All pipeline logic is declared in a single YAML config file. Python code is the execution engine.
 
@@ -28,8 +28,9 @@ src/impact/
 │   ├── transform/       # 7 built-in types: cast, rename, derive, fill_na, drop, filter, custom
 │   ├── validate/        # 5 built-in types: not_null, unique, range, expression, custom
 │   ├── model/           # Dynamic dataclass builder from YAML field definitions
+│   ├── sub_entity.py    # SubEntityProcessor + config resolver for nested entity_ref fields
 │   └── pipeline.py      # Orchestrator — ties all stages together
-└── common/              # Shared exceptions, logging, and utilities
+└── common/              # Shared exceptions (exceptions.py), logging (logging.py), and utilities (utils.py)
 ```
 
 ### Design Patterns
@@ -42,7 +43,7 @@ src/impact/
 ### Key Design Decisions
 
 1. **Config-as-schema** — The YAML `fields` section doubles as the dynamic class definition; no separate schema file.
-2. **Nested DataFrames** — 1-to-many joins store sub-DataFrames in cells to preserve primary table row count.
+2. **Nested DataFrames → Sub-Entities** — 1-to-many joins store sub-DataFrames in cells. When `entity_ref` is set, the pipeline validates and converts them into `list[SubEntity]` dataclass instances via `SubEntityProcessor`.
 3. **Immutability** — Transform/validation steps produce new DataFrames; inputs are never mutated.
 4. **Fail-fast** — Config is fully validated at parse time (Pydantic v2) before any data is touched.
 5. **Severity levels** — Validations use `error` (halt pipeline) or `warning` (log and continue).
@@ -52,13 +53,14 @@ src/impact/
 ```yaml
 entity:        # [required] Name, description, version
 parameters:    # [optional] Global defaults; overridden by pipeline.run(parameters={...})
-sources:       # [required] Data source definitions (exactly one must be primary: true)
+sources:       # [required for top-level; omit for sub-entity configs]
 joins:         # [optional] How to combine sources (one_to_one / one_to_many)
 filters:       # [optional] Row-level filter expressions applied after field processing
+validations:   # [optional] Global validation rules (applied after field processing)
 fields:        # [required] Output schema — one entry per output column
 ```
 
-`parameters`, `joins`, and `filters` are optional. Every pipeline must have `entity`, `sources`, and `fields`.
+`parameters`, `joins`, `filters`, and `validations` are optional. Every top-level pipeline must have `entity`, `sources`, and `fields`. Sub-entity configs (reused top-level configs) need only `entity` and `fields`.
 
 ### Field Definition Reference
 
@@ -104,7 +106,9 @@ fields:
     # --- Optional: inline validations ---
     validation_type: [<types>]   # one or more of: not_null, unique, range, expression, custom
     validation_rule:             # required for range and expression; omit for not_null/unique
-      range: [<min>, <max>]      #   use null for unbounded: [0, null]
+      range: [<min>, <max>]      #   [] inclusive, () exclusive, mix allowed
+                                 #   null for unbounded: [0, null] → x >= 0
+                                 #   string form: "(0, 1.0)" → 0 < x < 1.0
       expression: "<rule>"       #   pandas-eval boolean expression across the full DataFrame
     validation_severity:         # per-type severity override; default is "warning"
       <type>: error              #   "error" halts the pipeline; "warning" logs and continues
@@ -122,8 +126,9 @@ fields:
 | | dtype cast + fill_na | Cast and fill derived columns |
 | Filters | row filters | `filters:` expressions applied with @param support |
 | Validations | derived + global validations | Validate derived fields and any global rules |
+| **Sub-entities** | entity_ref processing | Nested DataFrames validated/transformed → `list[SubEntity]` |
 | **Build** | drop temp fields | Fields with `temp: true` removed from entity class |
-| | entity class | Built from remaining (non-temp) fields |
+| | entity class | Built from remaining (non-temp) fields; nested fields typed as `list` |
 
 ### Extending the System
 
@@ -176,11 +181,12 @@ result = EntityPipeline("configs/facility_example.yaml").run(
     parameters={"snapshot_date": "2025-12-31"}
 )
 
-result.entity_class      # Dynamically-created Facility dataclass
-result.entities          # List of Facility instances
-result.dataframe         # Processed pandas DataFrame
-result.validation_report # Aggregated validation results
-result.metadata          # Dict: entity_name, entity_version, source_count, record_count, field_count
+result.entity_class        # Dynamically-created Facility dataclass
+result.entities            # List of Facility instances
+result.dataframe           # Processed pandas DataFrame
+result.validation_report   # Aggregated validation results
+result.metadata            # Dict: entity_name, entity_version, source_count, record_count, field_count
+result.sub_entity_classes  # Dict: field_name → sub-entity class (e.g. {"collateral_items": Collateral})
 ```
 
 ## Key Implementation Details
@@ -235,13 +241,18 @@ on:
 
 Expression conditions use `left.col` / `right.col` notation; right-side columns get `_right` suffix after merge.
 
+### Join Execution Order
+
+Joins execute in config order. Each result updates `resolved[join_cfg.left]`, so later joins see the enriched source. This supports pre-joins between non-primary sources (e.g. enriching facility rows with collateral before nesting under obligor). The final result is `resolved[primary_name]`.
+
 ### FieldConfig Supported dtypes
 
 `str`, `string`, `int32`, `int64`, `float32`, `float64`, `bool`, `datetime`, `nested`
 
-- `nested` maps to `pd.DataFrame` (for one-to-many joined data)
+- `nested` with `entity_ref` maps to `list` (of sub-entity instances); without `entity_ref` maps to `pd.DataFrame`
 - Primary key fields have no default in the generated dataclass; all others default to `None`
 - The generated class gets `__entity_fields__`, `__primary_key__`, and `__entity_name__` attributes
+- Sub-entity configs are resolved by convention: `{snake_case(entity_ref)}.yaml` in the parent config's directory
 
 ### Custom Functions (Transform / Validator)
 

@@ -43,7 +43,12 @@ class EntityBuilder:
         entities = builder.to_entities(processed_df, FacilityClass)
     """
 
-    def build_class(self, entity_name: str, fields: list[FieldConfig]) -> type:
+    def build_class(
+        self,
+        entity_name: str,
+        fields: list[FieldConfig],
+        sub_entity_classes: dict[str, type] | None = None,
+    ) -> type:
         """Create a dataclass-based entity class from field configurations.
 
         Args:
@@ -57,15 +62,20 @@ class EntityBuilder:
             EntityBuildError: If the class cannot be created.
         """
         try:
+            sub_classes = sub_entity_classes or {}
             dc_fields: list[tuple[str, type, Any]] = []
 
             for f in fields:
-                py_type = DTYPE_MAP.get(f.dtype)
-                if py_type is None:
-                    raise EntityBuildError(
-                        f"Unknown dtype '{f.dtype}' for field '{f.name}'. "
-                        f"Available: {list(DTYPE_MAP.keys())}"
-                    )
+                # Nested fields with entity_ref use list type
+                if f.dtype == "nested" and f.name in sub_classes:
+                    py_type = list
+                else:
+                    py_type = DTYPE_MAP.get(f.dtype)
+                    if py_type is None:
+                        raise EntityBuildError(
+                            f"Unknown dtype '{f.dtype}' for field '{f.name}'. "
+                            f"Available: {list(DTYPE_MAP.keys())}"
+                        )
 
                 # Primary keys have no default; optional fields default to None
                 if f.primary_key:
@@ -146,7 +156,7 @@ class EntityBuilder:
                 for col in available_cols:
                     val = row[col]
                     # Convert numpy/pandas types to Python builtins where appropriate
-                    if isinstance(val, pd.DataFrame):
+                    if isinstance(val, (pd.DataFrame, list)):
                         kwargs[col] = val
                     elif pd.isna(val):
                         kwargs[col] = None

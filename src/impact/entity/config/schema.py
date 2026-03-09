@@ -174,6 +174,8 @@ class ValidationConfig(BaseModel):
     column: str | None = None
     min: float | None = None
     max: float | None = None
+    min_exclusive: bool = False
+    max_exclusive: bool = False
 
     # expression
     rule: str | None = None
@@ -326,13 +328,31 @@ class FieldConfig(BaseModel):
                 if raw is None:
                     raise ValueError(
                         f"Field '{self.name}': validation_type 'range' requires "
-                        "'range' key in validation_rule (e.g. [0.0, 1.0])"
+                        "'range' key in validation_rule (e.g. [0.0, 1.0] or (0.0, 1.0))"
                     )
-                if isinstance(raw, (list, tuple)):
+                min_exclusive = False
+                max_exclusive = False
+                if isinstance(raw, str):
+                    # Parse bracket notation: "[0, 1]", "(0, 1)", "[0, 1)", "(0, null]"
+                    stripped = raw.strip()
+                    if stripped[0] == "(":
+                        min_exclusive = True
+                    if stripped[-1] == ")":
+                        max_exclusive = True
+                    inner = stripped[1:-1]
+                    parts = [p.strip() for p in inner.split(",")]
+                    lo = None if parts[0] == "null" else float(parts[0])
+                    hi = None if parts[1] == "null" else float(parts[1])
+                elif isinstance(raw, (list, tuple)):
                     lo, hi = raw[0], raw[1]
                 else:
                     lo, hi = raw.get("min"), raw.get("max")
-                configs.append(ValidationConfig(**common, column=self.name, min=lo, max=hi))
+                    min_exclusive = raw.get("min_exclusive", False)
+                    max_exclusive = raw.get("max_exclusive", False)
+                configs.append(ValidationConfig(
+                    **common, column=self.name, min=lo, max=hi,
+                    min_exclusive=min_exclusive, max_exclusive=max_exclusive,
+                ))
 
             elif vtype == "expression":
                 rule_str = rules.get("expression")
@@ -374,7 +394,10 @@ class EntityConfig(BaseModel):
             "are shared across sources."
         ),
     )
-    sources: list[SourceConfig]
+    sources: list[SourceConfig] = Field(
+        default_factory=list,
+        description="Data sources. Omit for sub-entity configs (nested data comes from parent).",
+    )
     joins: list[JoinConfig] | None = None
     filters: list[str] | None = Field(
         None,
@@ -390,6 +413,8 @@ class EntityConfig(BaseModel):
 
     @model_validator(mode="after")
     def validate_single_primary(self) -> EntityConfig:
+        if not self.sources:
+            return self  # sub-entity configs have no sources
         primaries = [s for s in self.sources if s.primary]
         if len(primaries) != 1:
             raise ValueError(

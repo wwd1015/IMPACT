@@ -79,7 +79,11 @@ class UniqueValidator(Validator):
 # ---------------------------------------------------------------------------
 @ValidatorRegistry.register("range")
 class RangeValidator(Validator):
-    """Checks that a column's values fall within [min, max]."""
+    """Checks that a column's values fall within a range.
+
+    Supports inclusive ``[`` and exclusive ``(`` bounds:
+    ``[0, 1]`` → 0 ≤ x ≤ 1, ``(0, 1)`` → 0 < x < 1, ``[0, 1)`` → 0 ≤ x < 1.
+    """
 
     def validate(self, df: pd.DataFrame, config: ValidationConfig) -> ValidationResult:
         if not config.column:
@@ -94,17 +98,19 @@ class RangeValidator(Validator):
         mask = pd.Series(True, index=df.index)
 
         if config.min is not None:
-            mask &= col >= config.min
+            mask &= col > config.min if config.min_exclusive else col >= config.min
         if config.max is not None:
-            mask &= col <= config.max
+            mask &= col < config.max if config.max_exclusive else col <= config.max
 
         failing = df.index[~mask].tolist()
 
         bounds = []
         if config.min is not None:
-            bounds.append(f">= {config.min}")
+            op = ">" if config.min_exclusive else ">="
+            bounds.append(f"{op} {config.min}")
         if config.max is not None:
-            bounds.append(f"<= {config.max}")
+            op = "<" if config.max_exclusive else "<="
+            bounds.append(f"{op} {config.max}")
         bounds_str = " and ".join(bounds)
 
         return ValidationResult(

@@ -1,44 +1,120 @@
+# ---------------------------------------------------------------------------
+# Obligor — top-level entity that aggregates facility-level data
+#
+# This config demonstrates:
+#   - Using the same underlying table (facility_master) as the facility config,
+#     but viewed from the obligor perspective (primary key = obligor_id)
+#   - Pre-joining secondary sources before nesting (facility ↔ collateral first,
+#     then nesting enriched facilities under each obligor)
+#   - Derived aggregation fields using lambda functions over nested sub-entities
+#   - Recursive sub-entity processing: Obligor → Facility → Collateral
+# ---------------------------------------------------------------------------
+
 entity:
   name: Obligor
-  description: "Lending obligor (borrower) entity"
+  description: "Lending obligor (borrower) entity — aggregates facility-level data"
   version: "1.0"
 
 # ---------------------------------------------------------------------------
-# Global parameters — default values shared across all sources and filters.
-# The orchestration layer (Airflow, CLI, etc.) overrides these at runtime via
-# pipeline.run(parameters={...}). Source-level parameters override these for
-# that source only. Priority: runtime > source-level > global default.
+# Global parameters — same snapshot_date as the facility config.
+# Priority: runtime > source-level > global default.
 # ---------------------------------------------------------------------------
 parameters:
-  year: "2025"    # override per run: pipeline.run(parameters={"year": "2026"})
+  snapshot_date: "2025-12-31"
 
+# ---------------------------------------------------------------------------
+# Sources
+#
+# The obligor entity is derived from the same facility_master table.
+# We load it twice: once for distinct obligor-level attributes (primary),
+# and once for the full facility rows that will be nested under each obligor.
+# Collateral and rating overrides are loaded for pre-joining into facility rows.
+# ---------------------------------------------------------------------------
 sources:
   - name: obligor_main
-    type: csv
+    type: snowflake
     primary: true
-    path: "./data/obligors.csv"
+    connection:
+      account: "${SNOWFLAKE_ACCOUNT}"
+      database: CREDIT_DB
+      schema: LENDING
+      warehouse: "${SNOWFLAKE_WH:ANALYTICS_WH}"
+    query: |
+      SELECT DISTINCT obligor_id, legal_name, industry, country,
+             revenue, total_assets, total_liabilities, founded_date
+      FROM facility_master
+      WHERE snapshot_date = :snapshot_date
+
+  - name: facility_detail
+    type: snowflake
+    connection:
+      account: "${SNOWFLAKE_ACCOUNT}"
+      database: CREDIT_DB
+      schema: LENDING
+      warehouse: "${SNOWFLAKE_WH:ANALYTICS_WH}"
+    query: |
+      SELECT facility_id, obligor_id, product_type,
+             commitment_amount, outstanding_balance,
+             origination_date, maturity_date, interest_rate
+      FROM facility_master
+      WHERE snapshot_date = :snapshot_date
+
+  - name: collateral
+    type: parquet
+    path: "data/collateral/{snapshot_date}/*.parquet"
+
+  - name: rating_overrides
+    type: csv
+    path: "./data/rating_overrides.csv"
     options:
       delimiter: ","
+      encoding: "utf-8"
 
-  - name: financial_statements
-    type: parquet
-    path: "data/financials/{year}/*.parquet"   # {year} interpolated from parameters
-
+# ---------------------------------------------------------------------------
+# Joins — executed in order; each result updates the left source.
+#
+# Step 1-2: Pre-join collateral and rating overrides INTO facility_detail.
+#           After these joins, each facility row has collateral_items (nested
+#           DataFrame) and rating_override columns — matching what the
+#           facility_example.yaml config expects.
+# Step 3:   Nest the enriched facility rows under each obligor (one-to-many).
+# ---------------------------------------------------------------------------
 joins:
+  # Step 1: facility_detail ↔ collateral → adds collateral_items to each facility row
+  - left: facility_detail
+    right: collateral
+    how: left
+    on:
+      - left_col: facility_id
+        right_col: facility_id
+    relationship: one_to_many
+    nested_as: collateral_items
+
+  # Step 2: facility_detail ↔ rating_overrides → adds rating columns to each facility row
+  - left: facility_detail
+    right: rating_overrides
+    how: left
+    on:
+      - left_col: facility_id
+        right_col: facility_id
+      - left_col: product_type
+        right_col: product_type
+    relationship: one_to_one
+
+  # Step 3: obligor_main ↔ enriched facility_detail → nests facilities under each obligor
   - left: obligor_main
-    right: financial_statements
+    right: facility_detail
     how: left
     on:
       - left_col: obligor_id
         right_col: obligor_id
     relationship: one_to_many
-    nested_as: financials
+    nested_as: facilities
 
 # ---------------------------------------------------------------------------
 # Row filters — applied after all field processing (Pass 1 + Pass 2).
 # Each entry is a pandas eval expression evaluated in order.
-# Use @param_name to reference a runtime parameter (e.g. status == @active_status).
-# Static data-quality gates go here; source-level filtering belongs in the SQL query.
+# Use @param_name to reference a runtime parameter.
 # ---------------------------------------------------------------------------
 filters:
   - "total_assets > 0"
@@ -46,7 +122,7 @@ filters:
 fields:
   # ===========================================================================
   # PASS 1 — SOURCE FIELDS
-  # Loaded directly from source data. Processed first: rename/expr → cast → fill_na → validate.
+  # Obligor-level attributes from the primary source (obligor_main).
   # ===========================================================================
 
   - name: obligor_id
@@ -82,7 +158,7 @@ fields:
     dtype: float64
     validation_type: [range]
     validation_rule:
-      range: [0, null]               # revenue must be non-negative
+      range: [0, null]
     validation_severity:
       range: warning
 
@@ -98,17 +174,68 @@ fields:
     source: founded_date
     dtype: datetime
 
-  - name: financials
-    source: financial_statements.financials   # non-primary source: nested join result
+  # Nested facilities — each obligor's facility rows (pre-enriched with collateral
+  # and rating overrides via the join chain above).
+  # entity_ref: Facility resolves to facility_example.yaml, which defines the full
+  # Facility schema including entity_ref: Collateral for recursive processing.
+  # Result: each facility instance has a collateral_items attribute (list[Collateral]).
+  - name: facilities
+    source: facilities
     dtype: nested
-    entity_ref: FinancialStatement
-    description: "One-to-many financial statement records (nested DataFrame)"
+    entity_ref: Facility
+    description: "One-to-many facility positions (nested — processed as Facility sub-entities)"
 
   # ===========================================================================
   # PASS 2 — DERIVED FIELDS
-  # Computed after all source fields are renamed, cast, filled, and validated.
-  # Reference field names only — no src_name prefix needed or expected.
+  # Obligor-level aggregations computed from the nested facilities DataFrame.
+  # At this point facilities is still a pd.DataFrame (sub-entity processing
+  # runs after derived fields), so standard DataFrame operations work.
   # ===========================================================================
+
+  - name: facility_count
+    derived: "lambda row: len(row['facilities']) if not row['facilities'].empty else 0"
+    dtype: int64
+    description: "Number of facilities belonging to this obligor"
+
+  - name: total_commitment
+    derived: "lambda row: row['facilities']['commitment_amount'].sum() if not row['facilities'].empty else 0.0"
+    dtype: float64
+    description: "Sum of commitment_amount across all facilities"
+    validation_type: [range]
+    validation_rule:
+      range: [0, null]
+    validation_severity:
+      range: warning
+
+  - name: total_outstanding
+    derived: "lambda row: row['facilities']['outstanding_balance'].sum() if not row['facilities'].empty else 0.0"
+    dtype: float64
+    description: "Sum of outstanding_balance across all facilities"
+
+  - name: weighted_avg_rate
+    derived: >
+      lambda row: (
+        (row['facilities']['interest_rate'] * row['facilities']['commitment_amount']).sum()
+        / row['facilities']['commitment_amount'].sum()
+      ) if not row['facilities'].empty and row['facilities']['commitment_amount'].sum() > 0 else 0.0
+    dtype: float64
+    description: "Commitment-weighted average interest rate across all facilities"
+    validation_type: [range]
+    validation_rule:
+      range: [0.0, 1.0]
+    validation_severity:
+      range: warning
+
+  - name: total_collateral_value
+    derived: >
+      lambda row: sum(
+        row['facilities'].apply(
+          lambda f: f['collateral_items']['collateral_value'].sum()
+                    if not f['collateral_items'].empty else 0.0, axis=1
+        )
+      ) if not row['facilities'].empty else 0.0
+    dtype: float64
+    description: "Total collateral value across all facilities and their collateral positions"
 
   - name: debt_to_asset_ratio
     derived: "total_liabilities / total_assets"
@@ -116,7 +243,7 @@ fields:
     description: "Total liabilities divided by total assets"
     validation_type: [range]
     validation_rule:
-      range: [0.0, 10.0]            # flag extreme leverage
+      range: [0.0, 10.0]
     validation_severity:
       range: warning
 

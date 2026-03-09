@@ -23,6 +23,7 @@ A YAML-config-driven platform for financial lending credit modeling, providing s
 - [Developer Guide](#developer-guide)
   - [Architecture](#architecture)
   - [Pipeline Execution Order](#pipeline-execution-order)
+  - [Sub-Entity Processing](#sub-entity-processing)
   - [Adding a New Source Type](#adding-a-new-source-type)
   - [Adding a New Validator](#adding-a-new-validator)
   - [Adding a New Built-in Expression](#adding-a-new-built-in-expression)
@@ -65,11 +66,12 @@ result = EntityPipeline("configs/facility_example.yaml").run(
 `pipeline.run()` returns a `PipelineResult` with the following attributes:
 
 ```python
-result.entity_class       # dynamically-created dataclass (e.g. Facility)
-result.entities           # list of entity instances, one per row
-result.dataframe          # final processed pandas DataFrame
-result.validation_report  # aggregated ValidationReport (warnings + errors)
-result.metadata           # dict: entity_name, record_count, source_count, field_count
+result.entity_class        # dynamically-created dataclass (e.g. Facility)
+result.entities            # list of entity instances, one per row
+result.dataframe           # final processed pandas DataFrame
+result.validation_report   # aggregated ValidationReport (warnings + errors)
+result.metadata            # dict: entity_name, record_count, source_count, field_count
+result.sub_entity_classes  # dict: field_name → sub-entity class (e.g. {"collateral_items": Collateral})
 ```
 
 **Working with the validation report:**
@@ -116,7 +118,7 @@ Global default values shared across all sources and filters. The orchestration l
 ```yaml
 parameters:
   snapshot_date: "2025-12-31"    # static default; override at runtime via pipeline.run(parameters={...})
-  active_status: "ACTIVE"
+  active_product: "TERM_LOAN"
 ```
 
 **Environment variables** use `${VAR}` syntax and are intended for infrastructure values — credentials, warehouse names — that vary by environment. They are set outside the config (CI secrets, `.env` files, etc.).
@@ -232,6 +234,33 @@ joins:
     nested_as: collateral_items   # name of the resulting nested DataFrame column
 ```
 
+**Pre-joins between non-primary sources** — joins execute in config order, and each result updates the left source. This allows enriching a secondary source before nesting it under the primary. For example, to nest facilities (with collateral) under each obligor:
+
+```yaml
+joins:
+  # Step 1: enrich facility rows with collateral (secondary ↔ secondary)
+  - left: facility_detail
+    right: collateral
+    how: left
+    on:
+      - left_col: facility_id
+        right_col: facility_id
+    relationship: one_to_many
+    nested_as: collateral_items
+
+  # Step 2: nest enriched facility rows under each obligor (primary ↔ secondary)
+  - left: obligor_main
+    right: facility_detail
+    how: left
+    on:
+      - left_col: obligor_id
+        right_col: obligor_id
+    relationship: one_to_many
+    nested_as: facilities
+```
+
+After these joins, each obligor row's `facilities` nested DataFrame contains facility rows that already have `collateral_items` — enabling recursive sub-entity processing (Obligor → Facility → Collateral).
+
 **Expression-based join condition:**
 
 ```yaml
@@ -248,7 +277,7 @@ Row-level conditions applied **after all field processing** (Pass 1 + Pass 2). E
 ```yaml
 filters:
   - "commitment_amount > 0"        # static data-quality gate
-  - "status == @active_status"     # @name references a value from parameters
+  - "product_category == @active_product"  # @name references a value from parameters
 ```
 
 **AND / OR logic within a single filter** — use Python boolean syntax with parentheses for grouping. When conditions are logically related, combine them into one entry:
@@ -293,9 +322,10 @@ fields:
     dtype: str                  # REQUIRED — target type; cast is applied before fill_na
     description: "..."          # optional
     primary_key: true           # optional, default false
-    entity_ref: CollateralItem  # optional — names the sub-entity type stored in a nested column;
-                                #   must match the entity.name of the sub-entity's own YAML config;
-                                #   used for documentation and future typed-access support
+    entity_ref: Collateral      # optional — triggers sub-entity processing for nested fields.
+                                #   Must match entity.name in the sub-entity's YAML config.
+                                #   Each nested DataFrame cell is validated, transformed, and
+                                #   converted into a list of sub-entity dataclass instances.
     temp: false                 # optional, default false — if true, the field participates in
                                 #   processing and validation but is excluded from the entity class
     fill_na: "UNKNOWN"          # optional — scalar fill applied after cast; omit to skip
@@ -308,12 +338,12 @@ fields:
 
 | dtype | Python / pandas type |
 |---|---|
-| `str` | `str` |
+| `str` / `string` | `str` |
 | `int32` / `int64` | `numpy.int32` / `numpy.int64` |
 | `float32` / `float64` | `numpy.float32` / `numpy.float64` |
 | `bool` | `bool` |
 | `datetime` | `datetime64[ns]` via `pd.to_datetime` |
-| `nested` | `pd.DataFrame` per cell — no cast applied |
+| `nested` | `list` of sub-entity instances when `entity_ref` is set; `pd.DataFrame` otherwise |
 
 ---
 
@@ -336,11 +366,13 @@ fields:
   dtype: str
 
 # Nested result from a one-to-many join — use the bare column name (no prefix)
-# The join engine produces this column; it is not a raw source column
+# entity_ref triggers sub-entity processing: the nested DataFrame in each cell
+# is validated, transformed, and converted into a list of Collateral instances.
+# The entity_ref value must match entity.name in the sub-entity config file.
 - name: collateral_items
   source: collateral_items
   dtype: nested
-  entity_ref: CollateralItem
+  entity_ref: Collateral
 
 # Source expression — evaluated in Pass 1; src_name. prefixes are stripped automatically
 - name: available_capacity
@@ -384,7 +416,7 @@ Derived fields run after Pass 1 source fields are fully renamed, cast, filled, a
   dtype: float64
   validation_type: [not_null, range]
   validation_rule:
-    range: [0, null]           # null = unbounded; [min, max]
+    range: [0, null]           # [] = inclusive; null = unbounded → x >= 0
   validation_severity:
     not_null: error            # error halts the pipeline immediately
     range: warning             # warning logs and continues (this is the default if omitted)
@@ -394,7 +426,7 @@ Derived fields run after Pass 1 source fields are fully renamed, cast, filled, a
   dtype: float64
   validation_type: [range, expression]
   validation_rule:
-    range: [0.0, 1.0]
+    range: "[0.0, 1.0)"        # string with brackets: 0.0 <= x < 1.0
     expression: "outstanding_balance <= commitment_amount"
   validation_severity:
     expression: warning
@@ -406,7 +438,7 @@ Derived fields run after Pass 1 source fields are fully renamed, cast, filled, a
 |---|---|---|
 | `not_null` | — | No null values in this field |
 | `unique` | — | No duplicate values in this field |
-| `range` | `range: [min, max]` | Values within bounds; use `null` for unbounded |
+| `range` | `range: [min, max]` or `"(min, max)"` | Values within bounds; `[]` inclusive, `()` exclusive, mix allowed; use `null` for unbounded |
 | `expression` | `expression: "pandas expr"` | Boolean expression evaluated over the full DataFrame |
 | `custom` | `custom: "pkg.module.fn"` | User-defined function returning a `ValidationResult` |
 
@@ -471,6 +503,7 @@ src/impact/
     │   └── builtin.py       # not_null, unique, range, expression, custom
     ├── model/
     │   └── builder.py       # EntityBuilder — creates dataclasses at runtime from FieldConfig list
+    ├── sub_entity.py        # SubEntityProcessor — validates/transforms nested DataFrames into typed instances
     └── pipeline.py          # EntityPipeline orchestrator — ties all stages together
 ```
 
@@ -498,6 +531,8 @@ EntityPipeline.run(parameters)
 │       connector.load(source_cfg_with_merged_params)
 │
 ├── Stage 2 — Execute joins (in config order)
+│       Each join updates resolved[left] with the result
+│       Supports pre-joins between non-primary sources
 │       JoinEngine.execute() — flat (one_to_one) or nested (one_to_many)
 │
 ├── Stage 3 — Field processing
@@ -518,13 +553,103 @@ EntityPipeline.run(parameters)
 │       Global validations (config.validations section)
 │       Halt if any error-severity failure
 │
+├── Stage 4b — Sub-entity processing
+│       For each nested field with entity_ref:
+│         Resolve sub-entity config (convention-based file lookup)
+│         Process each cell's DataFrame through SubEntityProcessor
+│           (rename → cast → fill_na → validate → derived → build)
+│         Replace nested DataFrame cells with list[SubEntity]
+│         Merge sub-entity validation results into parent report
+│
 └── Stage 5 — Build entity
         Drop temp fields
-        EntityBuilder.build_class(entity_name, non_temp_fields)
+        EntityBuilder.build_class(entity_name, non_temp_fields, sub_entity_classes)
         EntityBuilder.to_entities(dataframe, entity_class)
 ```
 
 Source field validations run **between Pass 1 and Pass 2** deliberately — derived fields must operate on clean, validated source data.
+
+---
+
+### Sub-Entity Processing
+
+When a field has `dtype: nested` and `entity_ref` set, the pipeline automatically processes each nested DataFrame through a sub-entity pipeline. This validates, transforms, and converts nested data into typed dataclass instances.
+
+**How it works:**
+
+1. The parent pipeline's one-to-many join produces a nested `pd.DataFrame` in each cell of the nested column (e.g. `collateral_items`).
+2. After parent validations pass, the pipeline resolves the sub-entity config by convention — it looks for `{snake_case(entity_ref)}.yaml` or `{snake_case(entity_ref)}_example.yaml` in the same directory as the parent config.
+3. Each cell's DataFrame is processed through `SubEntityProcessor`, which applies the same two-pass field processing as the main pipeline (rename → cast → fill_na → validate → derived → build), but without sources, joins, or filters.
+4. The nested DataFrame cells are replaced with `list[SubEntity]` — each element is a dataclass instance of the sub-entity type.
+5. Sub-entity validation results are merged into the parent's `ValidationReport`.
+
+**Sub-entity config format** — same as a top-level config, but with no `sources`, `joins`, or `filters`:
+
+```yaml
+# configs/collateral_example.yaml
+entity:
+  name: Collateral
+  description: "Collateral position pledged against a facility"
+  version: "1.0"
+
+fields:
+  - name: collateral_type
+    source: collateral_type
+    dtype: str
+    validation_type: [not_null]
+    validation_severity:
+      not_null: error
+
+  - name: collateral_value
+    source: collateral_value
+    dtype: float64
+    validation_type: [not_null, range]
+    validation_rule:
+      range: [0, null]
+
+  - name: value_bucket
+    derived: "lambda row: 'HIGH' if row['collateral_value'] >= 500000 else ('MEDIUM' if row['collateral_value'] >= 100000 else 'LOW')"
+    dtype: str
+```
+
+**Accessing sub-entities at runtime:**
+
+```python
+result = EntityPipeline("configs/facility_example.yaml").run()
+
+facility = result.entities[0]
+facility.collateral_items          # → [Collateral(...), Collateral(...), ...]
+facility.collateral_items[0].collateral_type   # → 'REAL_ESTATE'
+facility.collateral_items[0].collateral_value  # → 500000.0
+
+result.sub_entity_classes          # → {"collateral_items": <class 'Collateral'>}
+```
+
+**Config file naming convention:**
+
+For `entity_ref: Collateral`, the pipeline searches in the parent config's directory for `{snake_case(entity_ref)}.yaml` or `{snake_case(entity_ref)}_example.yaml`. For multi-word names like `FinancialStatement`, it also tries the plain lowercase variants:
+1. `financial_statement.yaml`
+2. `financial_statement_example.yaml`
+3. `financialstatement.yaml`
+4. `financialstatement_example.yaml`
+
+**Recursive sub-entities** — sub-entity configs can themselves contain `entity_ref` fields, enabling multi-level nesting. For example, the obligor pipeline produces:
+
+```
+Obligor
+├── obligor_id, legal_name, ...
+├── total_commitment (derived — aggregated from facilities)
+└── facilities: list[Facility]
+    ├── facility_id, commitment_amount, ...
+    ├── utilization_rate (derived)
+    └── collateral_items: list[Collateral]
+        ├── collateral_type, collateral_value
+        └── value_bucket (derived)
+```
+
+**Reusing top-level configs as sub-entity configs** — a config with `sources` defined (like `facility_example.yaml`) can be used as a sub-entity config. The `SubEntityProcessor` ignores the `sources`, `joins`, and `filters` sections but uses the source names for prefix stripping (e.g. `source: rating_overrides.rating_override` → `rating_override`). This means a single config file defines both the standalone pipeline and the sub-entity schema.
+
+**Key files:** `src/impact/entity/sub_entity.py` (processor + config resolver), `src/impact/entity/model/builder.py` (handles `list` type for nested fields).
 
 ---
 

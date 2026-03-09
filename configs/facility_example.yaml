@@ -11,7 +11,7 @@ entity:
 # ---------------------------------------------------------------------------
 parameters:
   snapshot_date: "2025-12-31"            # override at runtime: pipeline.run(parameters={"snapshot_date": "..."})
-  active_status: "ACTIVE"        # override per run: pipeline.run(parameters={"active_status": "PENDING"})
+  active_product: "TERM_LOAN"    # override per run: pipeline.run(parameters={"active_product": "REVOLVER"})
 
 sources:
   - name: facility_main
@@ -64,12 +64,12 @@ joins:
 # ---------------------------------------------------------------------------
 # Row filters — applied after all field processing (Pass 1 + Pass 2).
 # Each entry is a pandas eval expression evaluated in order.
-# Use @param_name to reference a runtime parameter (e.g. status == @active_status).
+# Use @param_name to reference a runtime parameter (e.g. product_category == @active_product).
 # Static data-quality gates go here; source-level filtering belongs in the SQL query.
 # ---------------------------------------------------------------------------
 filters:
   - "commitment_amount > 0"                # static data-quality gate
-  - "status == @active_status"             # parameterized — value injected at runtime from parameters.active_status
+  - "product_category == @active_product"   # parameterized — value injected at runtime from parameters.active_product
   # Multiple conditions: use 'and' / 'or' with parentheses for grouping, same as Python.
   # Each filter is a separate pandas eval expression — multiple entries are AND-ed together
   # (each row must pass all filters). Use a single entry with 'or'/'and' for OR logic:
@@ -91,7 +91,11 @@ fields:
   #   temp               — if true, used during processing but dropped from entity class
   #   validation_type    — list of checks: not_null, unique, range, expression, custom
   #   validation_rule    — rules keyed by type (required for range and expression)
-  #     range: [min, max]           use null for unbounded, e.g. [0, null]
+  #     range: [min, max]           [] = inclusive, () = exclusive, mix allowed
+  #                                 e.g. [0, null]  → x >= 0 (no upper bound)
+  #                                      [0.0, 1.0] → 0.0 <= x <= 1.0
+  #                                      (0, 100)   → 0 < x < 100
+  #                                      [0, 1.0)   → 0 <= x < 1.0
   #     expression: "<pandas expr>"  boolean expression evaluated against the full DataFrame
   #   validation_severity — per-type severity override (default: warning)
   #     <type>: error               error halts the pipeline; warning logs and continues
@@ -177,9 +181,9 @@ fields:
   - name: collateral_items
     source: collateral_items                   # join engine output column (nested_as: collateral_items)
     dtype: nested                              # pd.DataFrame per row; no cast applied
-    entity_ref: CollateralItem                 # entity_ref: names the sub-entity type stored in this nested column.
-                                               # Used for documentation and future typed-access support.
-                                               # The value must match the entity.name of the sub-entity's own YAML config.
+    entity_ref: Collateral                 # entity_ref: names the sub-entity type stored in this nested column.
+                                               # Must match the entity.name in configs/collateral_item_example.yaml.
+                                               # Defines the nested DataFrame's schema, types, and validations.
     description: "One-to-many collateral positions (nested DataFrame)"
 
   - name: available_capacity

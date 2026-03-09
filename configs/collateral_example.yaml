@@ -1,0 +1,51 @@
+# ---------------------------------------------------------------------------
+# Collateral — sub-entity nested inside Facility.collateral_items
+#
+# This config defines the structure of the nested DataFrame stored in each
+# Facility row's collateral_items column. It is referenced by the parent
+# config via entity_ref: Collateral.
+#
+# Sub-entity configs use the same format as top-level entity configs but
+# have no sources, joins, or filters — the data comes from the parent
+# entity's one-to-many join.
+# ---------------------------------------------------------------------------
+
+entity:
+  name: Collateral
+  description: "Individual collateral position pledged against a facility"
+  version: "1.0"
+
+fields:
+  # ===========================================================================
+  # PASS 1 — SOURCE FIELDS
+  # These columns exist in the nested DataFrame produced by the parent
+  # Facility's one-to-many join with the collateral source.
+  # ===========================================================================
+
+  - name: collateral_type
+    source: collateral_type
+    dtype: str
+    description: "Type of collateral (e.g. REAL_ESTATE, EQUIPMENT, INVENTORY, RECEIVABLES)"
+    validation_type: [not_null]
+    validation_severity:
+      not_null: error
+
+  - name: collateral_value
+    source: collateral_value
+    dtype: float64
+    description: "Appraised value of the collateral position"
+    validation_type: [not_null, range]
+    validation_rule:
+      range: [0, null]              # collateral value must be non-negative
+    validation_severity:
+      not_null: error
+      range: warning
+
+  # ===========================================================================
+  # PASS 2 — DERIVED FIELDS
+  # ===========================================================================
+
+  - name: value_bucket
+    derived: "lambda row: 'HIGH' if row['collateral_value'] >= 500000 else ('MEDIUM' if row['collateral_value'] >= 100000 else 'LOW')"
+    dtype: str
+    description: "Collateral value tier: HIGH (>=500k), MEDIUM (>=100k), LOW (<100k)"

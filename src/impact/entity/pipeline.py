@@ -7,6 +7,7 @@ filter → validate → build), and returns a structured result.
 
 from __future__ import annotations
 
+import dataclasses
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -19,6 +20,7 @@ from impact.entity.config.parser import ConfigParser
 from impact.entity.config.schema import EntityConfig, FieldConfig, SourceConfig, TransformConfig
 from impact.entity.join.engine import JoinEngine
 from impact.entity.model.builder import EntityBuilder
+from impact.entity.sub_entity import SubEntityProcessor, resolve_sub_entity_config
 from impact.entity.transform.builtin import CastTransformer
 from impact.entity.validate.base import ValidationReport, ValidationResult
 
@@ -52,6 +54,7 @@ class PipelineResult:
     dataframe: pd.DataFrame
     validation_report: ValidationReport
     metadata: dict[str, Any]
+    sub_entity_classes: dict[str, type] = dataclasses.field(default_factory=dict)
 
 
 class EntityPipeline:
@@ -85,7 +88,9 @@ class EntityPipeline:
         """
         if config is not None:
             self.config = config
+            self.config_path: Path | None = None
         elif config_path is not None:
+            self.config_path = Path(config_path)
             self.config = ConfigParser().parse(config_path)
         else:
             raise ConfigError("Either config_path or config must be provided")
@@ -158,13 +163,18 @@ class EntityPipeline:
         if report.has_warnings:
             logger.warning("Validation completed with %d warnings", report.warning_count)
 
+        # 4b. Process sub-entities (nested fields with entity_ref)
+        sub_entity_classes = self._process_sub_entities(result_df, report)
+
         # 5. Drop temp fields, then build entity class and instances
         logger.info("Stage 5/5: Building entity class and instances")
         entity_fields = [f for f in self.config.fields if not f.temp]
         entity_cols = [f.name for f in entity_fields if f.name in result_df.columns]
         entity_df = result_df[entity_cols]
 
-        entity_cls = self.entity_builder.build_class(entity_name, entity_fields)
+        entity_cls = self.entity_builder.build_class(
+            entity_name, entity_fields, sub_entity_classes=sub_entity_classes
+        )
         entities = self.entity_builder.to_entities(entity_df, entity_cls)
 
         logger.info("=" * 60)
@@ -185,6 +195,7 @@ class EntityPipeline:
                 "record_count": len(result_df),
                 "field_count": len(entity_fields),
             },
+            sub_entity_classes=sub_entity_classes,
         )
 
     # ------------------------------------------------------------------
@@ -218,23 +229,31 @@ class EntityPipeline:
         return frames
 
     def _execute_joins(self, frames: dict[str, pd.DataFrame]) -> pd.DataFrame:
-        """Execute all configured joins in order."""
-        # Start with the primary source
+        """Execute all configured joins in order.
+
+        Joins are executed in config order. Each join uses ``join_cfg.left`` and
+        ``join_cfg.right`` to look up the current state of that source. After a
+        join, the left source is updated with the result. This supports pre-joins
+        between non-primary sources (e.g. joining collateral into facility rows
+        before nesting facilities under an obligor).
+        """
         primary_name = next(s.name for s in self.config.sources if s.primary)
-        result_df = frames[primary_name]
-        logger.info("  Primary source: '%s' (%d rows)", primary_name, len(result_df))
+        resolved: dict[str, pd.DataFrame] = dict(frames)
+        logger.info("  Primary source: '%s' (%d rows)", primary_name, len(resolved[primary_name]))
 
         for join_cfg in self.config.joins or []:
-            right_df = frames[join_cfg.right]
-            result_df = self.join_engine.execute(result_df, right_df, join_cfg)
+            left_df = resolved[join_cfg.left]
+            right_df = resolved[join_cfg.right]
+            joined = self.join_engine.execute(left_df, right_df, join_cfg)
+            resolved[join_cfg.left] = joined
             logger.info(
                 "  After join '%s' ↔ '%s': %d rows",
                 join_cfg.left,
                 join_cfg.right,
-                len(result_df),
+                len(joined),
             )
 
-        return result_df
+        return resolved[primary_name]
 
     def _apply_filters(self, df: pd.DataFrame, parameters: dict[str, Any]) -> pd.DataFrame:
         """Apply row-level filter conditions after all field processing.
@@ -360,6 +379,51 @@ class EntityPipeline:
         for src in sorted(source_names, key=len, reverse=True):
             expr = expr.replace(f"{src}.", "")
         return expr
+
+    def _process_sub_entities(
+        self, df: pd.DataFrame, report: ValidationReport
+    ) -> dict[str, type]:
+        """Process nested fields with entity_ref through sub-entity pipelines.
+
+        For each field with ``dtype: nested`` and ``entity_ref`` set, resolves the
+        sub-entity config and processes each cell's nested DataFrame through
+        ``SubEntityProcessor``. Replaces the nested DataFrame cells with lists of
+        sub-entity instances and merges sub-entity validation results into the
+        parent report.
+
+        Returns:
+            Mapping of field name → sub-entity class.
+        """
+        sub_entity_classes: dict[str, type] = {}
+        nested_fields = [
+            f for f in self.config.fields
+            if f.dtype == "nested" and f.entity_ref is not None
+        ]
+
+        if not nested_fields:
+            return sub_entity_classes
+
+        for field in nested_fields:
+            logger.info("  Processing sub-entity '%s' for field '%s'", field.entity_ref, field.name)
+            sub_config = resolve_sub_entity_config(field.entity_ref, self.config_path)
+            processor = SubEntityProcessor(sub_config, config_path=self.config_path)
+
+            entity_lists: list[list] = []
+            for idx, cell in enumerate(df[field.name]):
+                nested_df = cell if isinstance(cell, pd.DataFrame) else pd.DataFrame()
+                result = processor.process(nested_df)
+                entity_lists.append(result.entities)
+                report.results.extend(result.validation_report.results)
+
+                if idx == 0:
+                    sub_entity_classes[field.name] = result.entity_class
+
+            df[field.name] = entity_lists
+            logger.info(
+                "  Sub-entity '%s': processed %d cells", field.entity_ref, len(entity_lists)
+            )
+
+        return sub_entity_classes
 
     def _run_field_validations(
         self, df: pd.DataFrame, pass_filter: str | None = None
