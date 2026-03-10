@@ -48,7 +48,7 @@ class SourceConfig(BaseModel):
     """Configuration for a single data source."""
 
     name: str = Field(..., description="Unique source identifier")
-    type: Literal["snowflake", "parquet", "csv", "excel"] = Field(
+    type: Literal["snowflake", "sqlite", "parquet", "csv", "excel"] = Field(
         ..., description="Source type"
     )
     primary: bool = Field(False, description="Whether this is the primary source")
@@ -70,6 +70,11 @@ class SourceConfig(BaseModel):
             if not self.connection or not self.query:
                 raise ValueError(
                     f"Source '{self.name}': snowflake type requires 'connection' and 'query'"
+                )
+        elif self.type == "sqlite":
+            if not self.path or not self.query:
+                raise ValueError(
+                    f"Source '{self.name}': sqlite type requires 'path' and 'query'"
                 )
         elif self.type in ("parquet", "csv", "excel"):
             if not self.path:
@@ -310,6 +315,12 @@ class FieldConfig(BaseModel):
         Default severity is ``"warning"`` unless overridden in ``validation_severity``.
         """
         if not self.validation_type:
+            return []
+
+        # Filter by field origin (source vs derived)
+        if pass_filter == "source" and self.derived is not None:
+            return []
+        if pass_filter == "derived" and self.source is not None:
             return []
 
         rules = self.validation_rule or {}

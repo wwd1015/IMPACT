@@ -1,0 +1,177 @@
+# ---------------------------------------------------------------------------
+# Obligor Demo — top-level entity with nested Facility → Collateral
+#
+# Run: python scripts/generate_sample_data.py   (creates data/sample/ files)
+# Then: EntityPipeline("configs/demo/obligor_demo.yaml").run()
+# ---------------------------------------------------------------------------
+
+entity:
+  name: Obligor
+  description: "Lending obligor (borrower) entity — aggregates facility-level data (demo)"
+  version: "1.0"
+
+parameters:
+  snapshot_date: "2025-12-31"
+
+sources:
+  - name: obligor_main
+    type: csv
+    primary: true
+    path: "data/sample/obligor_main.csv"
+
+  - name: facility_detail
+    type: csv
+    path: "data/sample/facility_main.csv"
+
+  - name: collateral
+    type: parquet
+    path: "data/sample/collateral.parquet"
+
+  - name: rating_overrides
+    type: csv
+    path: "data/sample/rating_overrides.csv"
+
+joins:
+  # Step 1: facility_detail + collateral → nested collateral_items per facility
+  - left: facility_detail
+    right: collateral
+    how: left
+    "on":
+      - left_col: facility_id
+        right_col: facility_id
+    relationship: one_to_many
+    nested_as: collateral_items
+
+  # Step 2: facility_detail + rating_overrides → add rating columns
+  - left: facility_detail
+    right: rating_overrides
+    how: left
+    "on":
+      - left_col: facility_id
+        right_col: facility_id
+      - left_col: product_type
+        right_col: product_type
+    relationship: one_to_one
+
+  # Step 3: obligor_main + enriched facility_detail → nested facilities per obligor
+  - left: obligor_main
+    right: facility_detail
+    how: left
+    "on":
+      - left_col: obligor_id
+        right_col: obligor_id
+    relationship: one_to_many
+    nested_as: facilities
+
+filters:
+  - "total_assets > 0"
+
+fields:
+  # === PASS 1 — SOURCE FIELDS ===
+
+  - name: obligor_id
+    source: obligor_id
+    dtype: str
+    primary_key: true
+    validation_type: [not_null, unique]
+    validation_severity:
+      not_null: error
+      unique: error
+
+  - name: legal_name
+    source: legal_name
+    dtype: str
+    validation_type: [not_null]
+    validation_severity:
+      not_null: error
+
+  - name: industry
+    source: industry
+    dtype: str
+    fill_na: "UNKNOWN"
+
+  - name: country
+    source: country
+    dtype: str
+    fill_na: "US"
+
+  - name: revenue
+    source: revenue
+    dtype: float64
+    validation_type: [range]
+    validation_rule:
+      range: [0, null]
+    validation_severity:
+      range: warning
+
+  - name: total_assets
+    source: total_assets
+    dtype: float64
+
+  - name: total_liabilities
+    source: total_liabilities
+    dtype: float64
+
+  - name: founded_date
+    source: founded_date
+    dtype: datetime
+
+  - name: facilities
+    source: facilities
+    dtype: nested
+    entity_ref: Facility
+
+  # === PASS 2 — DERIVED FIELDS ===
+
+  - name: facility_count
+    derived: "lambda row: len(row['facilities']) if not row['facilities'].empty else 0"
+    dtype: int64
+
+  - name: total_commitment
+    derived: "lambda row: row['facilities']['commitment_amount'].sum() if not row['facilities'].empty else 0.0"
+    dtype: float64
+    validation_type: [range]
+    validation_rule:
+      range: [0, null]
+    validation_severity:
+      range: warning
+
+  - name: total_outstanding
+    derived: "lambda row: row['facilities']['outstanding_balance'].sum() if not row['facilities'].empty else 0.0"
+    dtype: float64
+
+  - name: weighted_avg_rate
+    derived: >
+      lambda row: (
+        (row['facilities']['interest_rate'] * row['facilities']['commitment_amount']).sum()
+        / row['facilities']['commitment_amount'].sum()
+      ) if not row['facilities'].empty and row['facilities']['commitment_amount'].sum() > 0 else 0.0
+    dtype: float64
+    validation_type: [range]
+    validation_rule:
+      range: [0.0, 1.0]
+    validation_severity:
+      range: warning
+
+  - name: total_collateral_value
+    derived: >
+      lambda row: sum(
+        row['facilities'].apply(
+          lambda f: f['collateral_items']['collateral_value'].sum()
+                    if not f['collateral_items'].empty else 0.0, axis=1
+        )
+      ) if not row['facilities'].empty else 0.0
+    dtype: float64
+
+  - name: debt_to_asset_ratio
+    derived: "total_liabilities / total_assets"
+    dtype: float64
+    validation_type: [range]
+    validation_rule:
+      range: [0.0, 10.0]
+    validation_severity:
+      range: warning
+
+  - name: leverage_flag
+    derived: "lambda row: 'HIGH' if row['total_liabilities'] > row['total_assets'] else 'NORMAL'"
+    dtype: str

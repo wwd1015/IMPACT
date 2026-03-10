@@ -1,0 +1,29 @@
+# Sub-entity config for Collateral — nested inside Facility.collateral_items
+# Referenced by entity_ref: Collateral in the parent config.
+
+entity:
+  name: Collateral
+  description: "Individual collateral position pledged against a facility"
+  version: "1.0"
+
+fields:
+  - name: collateral_type
+    source: collateral_type
+    dtype: str
+    validation_type: [not_null]
+    validation_severity:
+      not_null: error
+
+  - name: collateral_value
+    source: collateral_value
+    dtype: float64
+    validation_type: [not_null, range]
+    validation_rule:
+      range: [0, null]
+    validation_severity:
+      not_null: error
+      range: warning
+
+  - name: value_bucket
+    derived: "lambda row: 'HIGH' if row['collateral_value'] >= 500000 else ('MEDIUM' if row['collateral_value'] >= 100000 else 'LOW')"
+    dtype: str

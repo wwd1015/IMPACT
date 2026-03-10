@@ -44,7 +44,7 @@ joins:
   - left: facility_main
     right: collateral
     how: left
-    on:
+    "on":
       - left_col: facility_id
         right_col: facility_id
     relationship: one_to_many
@@ -53,7 +53,7 @@ joins:
   - left: facility_main
     right: rating_overrides
     how: left
-    on:
+    "on":
       # Multiple join keys: each entry is one key pair. All must match (AND logic).
       - left_col: facility_id
         right_col: facility_id

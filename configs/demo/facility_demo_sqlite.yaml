@@ -1,0 +1,159 @@
+# ---------------------------------------------------------------------------
+# Facility Demo (SQLite) — same pipeline as facility_demo.yaml but uses
+# a SQLite database for the primary source.
+#
+# Run: python scripts/generate_sample_data.py   (creates data/sample/ files)
+# Then: EntityPipeline("configs/demo/facility_demo_sqlite.yaml").run()
+# ---------------------------------------------------------------------------
+
+entity:
+  name: Facility
+  description: "Commercial lending facility entity (demo with SQLite source)"
+  version: "1.0"
+
+parameters:
+  snapshot_date: "2025-12-31"
+  active_product: "TERM_LOAN"
+
+sources:
+  - name: facility_main
+    type: sqlite
+    primary: true
+    path: "data/sample/lending.db"
+    query: |
+      SELECT facility_id, obligor_id, product_type,
+             commitment_amount, outstanding_balance,
+             origination_date, maturity_date, interest_rate
+      FROM facility_main
+      WHERE snapshot_date = :snapshot_date
+
+  - name: collateral
+    type: parquet
+    path: "data/sample/collateral.parquet"
+
+  - name: rating_overrides
+    type: csv
+    path: "data/sample/rating_overrides.csv"
+
+joins:
+  - left: facility_main
+    right: collateral
+    how: left
+    "on":
+      - left_col: facility_id
+        right_col: facility_id
+    relationship: one_to_many
+    nested_as: collateral_items
+
+  - left: facility_main
+    right: rating_overrides
+    how: left
+    "on":
+      - left_col: facility_id
+        right_col: facility_id
+      - left_col: product_type
+        right_col: product_type
+    relationship: one_to_one
+
+filters:
+  - "commitment_amount > 0"
+  - "product_category == @active_product"
+
+fields:
+  # === PASS 1 — SOURCE FIELDS ===
+
+  - name: facility_id
+    source: facility_id
+    dtype: str
+    primary_key: true
+    validation_type: [not_null, unique]
+    validation_severity:
+      not_null: error
+      unique: error
+
+  - name: obligor_id
+    source: obligor_id
+    dtype: str
+    validation_type: [not_null]
+    validation_severity:
+      not_null: error
+
+  - name: product_category
+    source: product_type
+    dtype: str
+    fill_na: "UNKNOWN"
+
+  - name: commitment_amount
+    source: commitment_amount
+    dtype: float64
+    validation_type: [not_null, range]
+    validation_rule:
+      range: [0, null]
+    validation_severity:
+      not_null: error
+
+  - name: outstanding_balance
+    source: outstanding_balance
+    dtype: float64
+
+  - name: interest_rate
+    source: interest_rate
+    dtype: float64
+    fill_na: 0.0
+    validation_type: [range]
+    validation_rule:
+      range: [0.0, 1.0]
+    validation_severity:
+      range: warning
+
+  - name: origination_date
+    source: origination_date
+    dtype: datetime
+
+  - name: maturity_date
+    source: maturity_date
+    dtype: datetime
+
+  - name: rating_override
+    source: rating_overrides.rating_override
+    dtype: str
+
+  - name: collateral_items
+    source: collateral_items
+    dtype: nested
+    entity_ref: Collateral
+
+  - name: available_capacity
+    source: "facility_main.commitment_amount - facility_main.outstanding_balance"
+    dtype: float64
+    temp: true
+
+  # === PASS 2 — DERIVED FIELDS ===
+
+  - name: utilization_rate
+    derived: "outstanding_balance / commitment_amount"
+    dtype: float64
+    validation_type: [range, expression]
+    validation_rule:
+      range: [0.0, 1.0]
+      expression: "outstanding_balance <= commitment_amount"
+    validation_severity:
+      range: warning
+      expression: warning
+
+  - name: capacity_utilization
+    derived: "1 - available_capacity / commitment_amount"
+    dtype: float64
+
+  - name: total_collateral_value
+    derived: "lambda row: row['collateral_items']['collateral_value'].sum() if not row['collateral_items'].empty else 0.0"
+    dtype: float64
+
+  - name: days_to_maturity
+    derived: "lambda row: (row['maturity_date'] - row['origination_date']).days"
+    dtype: int64
+    validation_type: [range]
+    validation_rule:
+      range: [0, null]
+    validation_severity:
+      range: error

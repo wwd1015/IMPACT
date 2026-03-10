@@ -1,0 +1,105 @@
+# Sub-entity config for Facility — nested inside Obligor.facilities
+# Referenced by entity_ref: Facility in the obligor config.
+# When used as a sub-entity, sources/joins/filters are ignored —
+# data comes from the parent's one-to-many join.
+
+entity:
+  name: Facility
+  description: "Commercial lending facility entity"
+  version: "1.0"
+
+# Sources listed here allow source-prefix stripping in field references.
+# The actual data comes from the parent entity's join, not these sources.
+sources:
+  - name: facility_main
+    type: csv
+    primary: true
+    path: "data/sample/facility_main.csv"
+
+  - name: collateral
+    type: parquet
+    path: "data/sample/collateral.parquet"
+
+  - name: rating_overrides
+    type: csv
+    path: "data/sample/rating_overrides.csv"
+
+fields:
+  - name: facility_id
+    source: facility_id
+    dtype: str
+    primary_key: true
+    validation_type: [not_null, unique]
+    validation_severity:
+      not_null: error
+      unique: error
+
+  - name: obligor_id
+    source: obligor_id
+    dtype: str
+
+  - name: product_category
+    source: product_type
+    dtype: str
+    fill_na: "UNKNOWN"
+
+  - name: commitment_amount
+    source: commitment_amount
+    dtype: float64
+    validation_type: [not_null, range]
+    validation_rule:
+      range: [0, null]
+    validation_severity:
+      not_null: error
+
+  - name: outstanding_balance
+    source: outstanding_balance
+    dtype: float64
+
+  - name: interest_rate
+    source: interest_rate
+    dtype: float64
+    fill_na: 0.0
+
+  - name: origination_date
+    source: origination_date
+    dtype: datetime
+
+  - name: maturity_date
+    source: maturity_date
+    dtype: datetime
+
+  - name: rating_override
+    source: rating_overrides.rating_override
+    dtype: str
+
+  - name: collateral_items
+    source: collateral_items
+    dtype: nested
+    entity_ref: Collateral
+
+  - name: available_capacity
+    source: "facility_main.commitment_amount - facility_main.outstanding_balance"
+    dtype: float64
+    temp: true
+
+  - name: utilization_rate
+    derived: "outstanding_balance / commitment_amount"
+    dtype: float64
+
+  - name: capacity_utilization
+    derived: "1 - available_capacity / commitment_amount"
+    dtype: float64
+
+  - name: total_collateral_value
+    derived: "lambda row: row['collateral_items']['collateral_value'].sum() if not row['collateral_items'].empty else 0.0"
+    dtype: float64
+
+  - name: days_to_maturity
+    derived: "lambda row: (row['maturity_date'] - row['origination_date']).days"
+    dtype: int64
+    validation_type: [range]
+    validation_rule:
+      range: [0, null]
+    validation_severity:
+      range: error

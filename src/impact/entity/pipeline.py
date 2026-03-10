@@ -29,6 +29,7 @@ from impact.entity.validate.base import ValidationReport
 import impact.entity.source.csv_excel  # noqa: F401
 import impact.entity.source.parquet  # noqa: F401
 import impact.entity.source.snowflake  # noqa: F401
+import impact.entity.source.sqlite  # noqa: F401
 import impact.entity.transform.builtin  # noqa: F401
 import impact.entity.validate.builtin  # noqa: F401
 
