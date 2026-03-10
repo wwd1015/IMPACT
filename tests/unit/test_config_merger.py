@@ -262,6 +262,14 @@ class TestMergeEdgeCases:
         merged = merge_raw_configs(primary, custom)
         assert len(merged["joins"]) == 2
 
+    def test_unknown_custom_sections_ignored(self):
+        """Unknown sections in custom config are silently ignored."""
+        primary = {"entity": {"name": "Facility"}}
+        custom = {"typo_sorces": [{"name": "x"}], "transforms": []}
+        merged = merge_raw_configs(primary, custom)
+        assert "typo_sorces" not in merged
+        assert "transforms" not in merged
+
     def test_multiple_fields_mixed_override_and_add(self):
         primary = {"fields": [
             {"name": "a", "source": "a", "dtype": "str"},

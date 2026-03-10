@@ -28,7 +28,7 @@ Usage::
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from impact.common.exceptions import ConfigError
 from impact.common.logging import get_logger
@@ -36,6 +36,8 @@ from impact.entity.config.parser import ConfigParser
 from impact.entity.config.schema import EntityConfig
 
 logger = get_logger(__name__)
+
+_KNOWN_SECTIONS = {"entity", "parameters", "sources", "joins", "filters", "fields", "validations"}
 
 
 def merge_configs(
@@ -59,14 +61,13 @@ def merge_configs(
         ConfigError: If either file cannot be read, parsed, or the merged result
             fails validation.
     """
-    parser = ConfigParser()
-    primary_raw = parser._load_yaml(Path(primary))
-    custom_raw = parser._load_yaml(Path(custom))
+    primary_raw = ConfigParser.load_yaml(Path(primary))
+    custom_raw = ConfigParser.load_yaml(Path(custom))
 
     merged = merge_raw_configs(primary_raw, custom_raw)
 
     # Interpolate env vars on the merged result
-    merged = parser._interpolate_env(merged)
+    merged = ConfigParser.interpolate_env(merged)
 
     try:
         config = EntityConfig.model_validate(merged)
@@ -93,18 +94,25 @@ def merge_raw_configs(
     The primary dict is the base. The custom dict overrides or extends it.
     Returns a new dict — neither input is mutated.
     """
+    # Warn on unknown sections in custom config
+    unknown = set(custom) - _KNOWN_SECTIONS
+    if unknown:
+        logger.warning("  [merge] custom config has unknown sections (ignored): %s", sorted(unknown))
+
     merged: dict[str, Any] = {}
 
     # --- entity ---
-    merged["entity"] = _merge_entity(
+    merged["entity"] = _merge_dict(
         primary.get("entity", {}),
         custom.get("entity", {}),
+        section="entity",
     )
 
     # --- parameters ---
-    merged["parameters"] = _merge_parameters(
+    merged["parameters"] = _merge_dict(
         primary.get("parameters", {}),
         custom.get("parameters", {}),
+        section="parameters",
     )
 
     # --- sources ---
@@ -116,9 +124,11 @@ def merge_raw_configs(
     )
 
     # --- joins ---
-    merged["joins"] = _merge_joins(
+    merged["joins"] = _merge_by_key(
         primary.get("joins", []),
         custom.get("joins", []),
+        key=lambda j: (j.get("left", ""), j.get("right", "")),
+        section="joins",
     )
 
     # --- filters ---
@@ -151,23 +161,11 @@ def merge_raw_configs(
 # ---------------------------------------------------------------------------
 
 
-def _merge_entity(
-    primary: dict[str, Any], custom: dict[str, Any],
-) -> dict[str, Any]:
-    """Merge entity metadata — custom overrides individual keys."""
-    if not custom:
-        return dict(primary)
-    result = {**primary, **custom}
-    overridden = [k for k in custom if k in primary and custom[k] != primary.get(k)]
-    if overridden:
-        logger.info("  [merge] entity: overridden keys: %s", overridden)
-    return result
-
-
-def _merge_parameters(
+def _merge_dict(
     primary: dict[str, Any] | None, custom: dict[str, Any] | None,
+    section: str,
 ) -> dict[str, Any]:
-    """Merge parameters — custom wins on key conflict."""
+    """Merge two dicts — custom wins on key conflict (entity, parameters)."""
     p = primary or {}
     c = custom or {}
     if not c:
@@ -176,89 +174,55 @@ def _merge_parameters(
     overridden = [k for k in c if k in p and c[k] != p.get(k)]
     added = [k for k in c if k not in p]
     if overridden:
-        logger.info("  [merge] parameters: overridden: %s", overridden)
-    if added:
-        logger.info("  [merge] parameters: added: %s", added)
-    return result
-
-
-def _merge_by_key(
-    primary: list[dict[str, Any]],
-    custom: list[dict[str, Any]],
-    key: str,
-    section: str,
-) -> list[dict[str, Any]]:
-    """Merge two lists of dicts by a key field (e.g. 'name').
-
-    Same key = custom replaces primary entry. New keys = appended.
-    Preserves primary ordering; custom additions go at the end.
-    """
-    if not custom:
-        return list(primary)
-
-    custom_map = {item[key]: item for item in custom if key in item}
-    overridden: list[str] = []
-    added: list[str] = []
-
-    # Start with primary, replacing where custom overrides
-    result = []
-    for item in primary:
-        item_key = item.get(key)
-        if item_key in custom_map:
-            result.append(custom_map.pop(item_key))
-            overridden.append(item_key)
-        else:
-            result.append(dict(item))
-
-    # Append remaining custom entries (new additions)
-    for item_key, item in custom_map.items():
-        result.append(item)
-        added.append(item_key)
-
-    if overridden:
         logger.info("  [merge] %s: overridden: %s", section, overridden)
     if added:
         logger.info("  [merge] %s: added: %s", section, added)
     return result
 
 
-def _merge_joins(
+def _merge_by_key(
     primary: list[dict[str, Any]] | None,
     custom: list[dict[str, Any]] | None,
+    key: str | Callable[[dict[str, Any]], Any],
+    section: str,
 ) -> list[dict[str, Any]]:
-    """Merge joins by (left, right) key pair.
+    """Merge two lists of dicts by a key (string field name or callable extractor).
 
-    Same pair = custom replaces. New pairs = appended after primary joins.
+    Same key = custom replaces primary entry. New keys = appended.
+    Preserves primary ordering; custom additions go at the end.
     """
-    p = primary or []
-    c = custom or []
+    p = list(primary or [])
+    c = list(custom or [])
     if not c:
-        return list(p)
+        return [dict(item) for item in p]
 
-    def _join_key(j: dict) -> tuple[str, str]:
-        return (j.get("left", ""), j.get("right", ""))
+    key_fn: Callable[[dict[str, Any]], Any] = (
+        (lambda item, k=key: item.get(k)) if isinstance(key, str) else key
+    )
 
-    custom_map = {_join_key(j): j for j in c}
+    custom_map = {key_fn(item): item for item in c}
     overridden: list[str] = []
     added: list[str] = []
 
+    # Start with primary, replacing where custom overrides
     result = []
-    for j in p:
-        jk = _join_key(j)
-        if jk in custom_map:
-            result.append(custom_map.pop(jk))
-            overridden.append(f"{jk[0]}↔{jk[1]}")
+    for item in p:
+        item_key = key_fn(item)
+        if item_key in custom_map:
+            result.append(custom_map.pop(item_key))
+            overridden.append(str(item_key))
         else:
-            result.append(dict(j))
+            result.append(dict(item))
 
-    for jk, j in custom_map.items():
-        result.append(j)
-        added.append(f"{jk[0]}↔{jk[1]}")
+    # Append remaining custom entries (new additions)
+    for item_key, item in custom_map.items():
+        result.append(item)
+        added.append(str(item_key))
 
     if overridden:
-        logger.info("  [merge] joins: overridden: %s", overridden)
+        logger.info("  [merge] %s: overridden: %s", section, overridden)
     if added:
-        logger.info("  [merge] joins: added: %s", added)
+        logger.info("  [merge] %s: added: %s", section, added)
     return result
 
 

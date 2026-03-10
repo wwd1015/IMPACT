@@ -69,8 +69,8 @@ class ConfigParser:
             raise ConfigError(f"Config file not found: {path}")
 
         logger.info("Parsing config: %s", path)
-        raw = self._load_yaml(path)
-        raw = self._interpolate_env(raw)
+        raw = self.load_yaml(path)
+        raw = self.interpolate_env(raw)
 
         try:
             config = EntityConfig.model_validate(raw)
@@ -93,7 +93,7 @@ class ConfigParser:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _load_yaml(path: Path) -> dict[str, Any]:
+    def load_yaml(path: Path) -> dict[str, Any]:
         """Load a YAML file using safe_load."""
         try:
             with path.open("r", encoding="utf-8") as fh:
@@ -107,14 +107,14 @@ class ConfigParser:
         return data
 
     @classmethod
-    def _interpolate_env(cls, obj: Any) -> Any:
+    def interpolate_env(cls, obj: Any) -> Any:
         """Recursively replace ``${VAR}`` / ``${VAR:default}`` with resolved values."""
         if isinstance(obj, str):
             return cls._replace_env_vars(obj)
         if isinstance(obj, dict):
-            return {k: cls._interpolate_env(v) for k, v in obj.items()}
+            return {k: cls.interpolate_env(v) for k, v in obj.items()}
         if isinstance(obj, list):
-            return [cls._interpolate_env(item) for item in obj]
+            return [cls.interpolate_env(item) for item in obj]
         return obj
 
     @staticmethod
