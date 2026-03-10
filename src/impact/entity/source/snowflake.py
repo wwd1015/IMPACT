@@ -64,7 +64,10 @@ class SnowflakeConnector(DataSourceConnector):
             conn = snowflake.connector.connect(**connect_kwargs)
             try:
                 cursor = conn.cursor()
-                cursor.execute(config.query, config.parameters or {})
+                params = config.parameters or {}
+                # Interpolate {param} placeholders for identifiers (table/column names)
+                resolved_query = config.query.format(**params) if params else config.query
+                cursor.execute(resolved_query, params)
                 df = cursor.fetch_pandas_all()
             finally:
                 conn.close()

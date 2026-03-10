@@ -1,8 +1,18 @@
 # ---------------------------------------------------------------------------
-# Obligor Demo — top-level entity with nested Facility → Collateral
+# Obligor Demo — top-level entity with 3-level nesting (Obligor → Facility → Collateral)
 #
-# Run: python scripts/generate_sample_data.py   (creates data/sample/ files)
-# Then: EntityPipeline("configs/demo/obligor_demo.yaml").run()
+# Sources:
+#   - obligor_main:     SQLite database
+#   - facility_detail:  SQLite database (same DB, different query)
+#   - collateral:       Parquet file
+#   - rating_overrides: CSV file
+#
+# Setup:
+#   python scripts/generate_sample_data.py
+#
+# Run:
+#   from impact.entity.pipeline import EntityPipeline
+#   result = EntityPipeline("configs/demo/obligor_demo.yaml").run()
 # ---------------------------------------------------------------------------
 
 entity:
@@ -12,16 +22,29 @@ entity:
 
 parameters:
   snapshot_date: "2025-12-31"
+  obligor_table: "obligor_main"
+  facility_table: "facility_main"
 
 sources:
   - name: obligor_main
-    type: csv
+    type: sqlite
     primary: true
-    path: "data/sample/obligor_main.csv"
+    path: "data/sample/lending.db"
+    query: |
+      SELECT DISTINCT obligor_id, legal_name, industry, country,
+             revenue, total_assets, total_liabilities, founded_date
+      FROM {obligor_table}
+      WHERE snapshot_date = :snapshot_date
 
   - name: facility_detail
-    type: csv
-    path: "data/sample/facility_main.csv"
+    type: sqlite
+    path: "data/sample/lending.db"
+    query: |
+      SELECT facility_id, obligor_id, product_type,
+             commitment_amount, outstanding_balance,
+             origination_date, maturity_date, interest_rate
+      FROM {facility_table}
+      WHERE snapshot_date = :snapshot_date
 
   - name: collateral
     type: parquet
@@ -32,7 +55,6 @@ sources:
     path: "data/sample/rating_overrides.csv"
 
 joins:
-  # Step 1: facility_detail + collateral → nested collateral_items per facility
   - left: facility_detail
     right: collateral
     how: left
@@ -42,7 +64,6 @@ joins:
     relationship: one_to_many
     nested_as: collateral_items
 
-  # Step 2: facility_detail + rating_overrides → add rating columns
   - left: facility_detail
     right: rating_overrides
     how: left
@@ -53,7 +74,6 @@ joins:
         right_col: product_type
     relationship: one_to_one
 
-  # Step 3: obligor_main + enriched facility_detail → nested facilities per obligor
   - left: obligor_main
     right: facility_detail
     how: left
