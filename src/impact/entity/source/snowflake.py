@@ -18,8 +18,8 @@ class SnowflakeConnector(DataSourceConnector):
     """Loads data from Snowflake using ``snowflake-connector-python``.
 
     Connection parameters are read from the ``connection`` block in the
-    source config.  Query parameters (e.g. ``snapshot_date``) are passed
-    as bind variables.
+    source config. Query parameters use ``{param}`` syntax — interpolated
+    into the query string before execution.
     """
 
     def load(self, config: SourceConfig) -> pd.DataFrame:
@@ -65,9 +65,8 @@ class SnowflakeConnector(DataSourceConnector):
             try:
                 cursor = conn.cursor()
                 params = config.parameters or {}
-                # Interpolate {param} placeholders for identifiers (table/column names)
                 resolved_query = config.query.format(**params) if params else config.query
-                cursor.execute(resolved_query, params)
+                cursor.execute(resolved_query)
                 df = cursor.fetch_pandas_all()
             finally:
                 conn.close()

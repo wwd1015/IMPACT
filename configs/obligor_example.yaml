@@ -43,7 +43,7 @@ sources:
       SELECT DISTINCT obligor_id, legal_name, industry, country,
              revenue, total_assets, total_liabilities, founded_date
       FROM facility_master
-      WHERE snapshot_date = :snapshot_date
+      WHERE snapshot_date = '{snapshot_date}'
 
   - name: facility_detail
     type: snowflake
@@ -57,7 +57,7 @@ sources:
              commitment_amount, outstanding_balance,
              origination_date, maturity_date, interest_rate
       FROM facility_master
-      WHERE snapshot_date = :snapshot_date
+      WHERE snapshot_date = '{snapshot_date}'
 
   - name: collateral
     type: parquet

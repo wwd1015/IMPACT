@@ -27,7 +27,7 @@ sources:
              commitment_amount, outstanding_balance,
              origination_date, maturity_date, interest_rate
       FROM facility_master
-      WHERE snapshot_date = :snapshot_date    -- bound from parameters.snapshot_date
+      WHERE snapshot_date = '{snapshot_date}'
 
   - name: collateral
     type: parquet

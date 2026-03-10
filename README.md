@@ -162,7 +162,7 @@ sources:
     query: |
       SELECT facility_id, commitment_amount
       FROM facility_master
-      WHERE snapshot_date = :snapshot_date   -- :name syntax binds from parameters.snapshot_date
+      WHERE snapshot_date = '{snapshot_date}'
 ```
 
 **Parquet:**

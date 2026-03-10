@@ -30,7 +30,7 @@ parameters:
   source_table: "facility_main"    # parameterized table name — override at runtime
 
 sources:
-  # SQLite source — demonstrates {param} for table names, :param for WHERE values
+  # SQLite source — {param} syntax works for both table names and values
   - name: facility_main
     type: sqlite
     primary: true
@@ -40,7 +40,7 @@ sources:
              commitment_amount, outstanding_balance,
              origination_date, maturity_date, interest_rate
       FROM {source_table}
-      WHERE snapshot_date = :snapshot_date
+      WHERE snapshot_date = '{snapshot_date}'
 
   # Parquet source
   - name: collateral
