@@ -15,7 +15,7 @@ import pandas as pd
 
 from impact.common.exceptions import TransformError, ValidationError
 from impact.common.logging import get_logger
-from impact.common.utils import cast_and_fill, strip_source_prefixes
+from impact.common.utils import cast_and_fill, format_lambda_diagnostic, strip_source_prefixes
 from impact.entity.config.parser import ConfigParser
 from impact.entity.config.schema import EntityConfig, FieldConfig
 from impact.entity.model.builder import EntityBuilder
@@ -87,7 +87,7 @@ class SubEntityProcessor:
         # Source field validations
         report = self._run_field_validations(result, pass_filter="source")
         if report.has_errors:
-            raise ValidationError(report=report, message=str(report))
+            raise ValidationError(report=report, message=report.format_detail())
 
         # Pass 2: derived fields (eval → cast → fill_na)
         result = self._apply_derived_fields(result)
@@ -96,7 +96,7 @@ class SubEntityProcessor:
         derived_report = self._run_field_validations(result, pass_filter="derived")
         report.results.extend(derived_report.results)
         if report.has_errors:
-            raise ValidationError(report=report, message=str(report))
+            raise ValidationError(report=report, message=report.format_detail())
 
         # Recursive sub-entity processing (e.g. Facility → Collateral)
         sub_entity_classes = process_sub_entity_fields(
@@ -187,8 +187,13 @@ class SubEntityProcessor:
                 else:
                     result[field.name] = result.eval(expr)
             except Exception as exc:
+                diag, samples = "", []
+                if expr.startswith("lambda"):
+                    diag, samples = format_lambda_diagnostic(result, fn)
                 raise TransformError(
-                    f"{err_ctx}field '{field.name}': derived expression failed: {exc}"
+                    f"{err_ctx}field '{field.name}': derived expression failed: {exc}.{diag}",
+                    field=field.name,
+                    failing_samples=samples,
                 ) from exc
             result = cast_and_fill(
                 result, field.name, field.dtype, field.fill_na,
@@ -214,17 +219,20 @@ def process_sub_entity_fields(
     df: pd.DataFrame,
     report: ValidationReport,
     config_path: Path | None,
+    parent_context: str = "",
 ) -> dict[str, type]:
     """Process nested fields with entity_ref through sub-entity pipelines.
 
-    Shared by both ``EntityPipeline._process_sub_entities`` and
-    ``SubEntityProcessor._process_nested_sub_entities`` to avoid duplication.
+    Shared by both ``EntityPipeline`` and ``SubEntityProcessor`` to avoid
+    duplication. When a sub-entity cell fails, the error includes the parent
+    row context (primary key values) so the user can locate the exact record.
 
     Args:
         fields: All field configs (filtered internally for nested + entity_ref).
         df: DataFrame whose nested columns will be replaced with entity lists.
         report: Parent validation report to merge sub-entity results into.
         config_path: Path to the parent config file (for sub-entity resolution).
+        parent_context: Optional context prefix from a higher-level parent.
 
     Returns:
         Mapping of field name → sub-entity class.
@@ -237,6 +245,9 @@ def process_sub_entity_fields(
     if not nested_fields:
         return sub_entity_classes
 
+    # Find primary key columns for parent context
+    pk_cols = [f.name for f in fields if f.primary_key and f.name in df.columns]
+
     for field in nested_fields:
         logger.info("  Processing sub-entity '%s' for field '%s'", field.entity_ref, field.name)
         sub_config = resolve_sub_entity_config(field.entity_ref, config_path)
@@ -245,7 +256,25 @@ def process_sub_entity_fields(
         entity_lists: list[list] = []
         for idx, cell in enumerate(df[field.name]):
             nested_df = cell if isinstance(cell, pd.DataFrame) else pd.DataFrame()
-            result = processor.process(nested_df)
+
+            try:
+                result = processor.process(nested_df)
+            except (TransformError, ValidationError) as exc:
+                row_ctx = _build_row_context(df, idx, pk_cols, field.entity_ref, parent_context)
+                new_exc = type(exc)(f"{row_ctx}: {exc}")
+                if isinstance(exc, TransformError):
+                    new_exc.field = exc.field
+                    new_exc.failing_samples = exc.failing_samples
+                elif isinstance(exc, ValidationError):
+                    new_exc.report = exc.report
+                raise new_exc from exc
+
+            # Tag sub-entity validation results with parent context (only if any exist)
+            if result.validation_report.results:
+                row_ctx = _build_row_context(df, idx, pk_cols, field.entity_ref, parent_context)
+                for v_result in result.validation_report.results:
+                    v_result.context = row_ctx
+
             entity_lists.append(result.entities)
             report.results.extend(result.validation_report.results)
             if idx == 0:
@@ -255,6 +284,27 @@ def process_sub_entity_fields(
         logger.info("  Sub-entity '%s': processed %d cells", field.entity_ref, len(entity_lists))
 
     return sub_entity_classes
+
+
+def _build_row_context(
+    df: pd.DataFrame, idx: int, pk_cols: list[str],
+    entity_ref: str, parent_context: str,
+) -> str:
+    """Build a human-readable context string identifying a parent row.
+
+    Example output: ``"Parent row 3 (facility_id='FAC-001'), sub-entity 'Collateral'"``
+    """
+    parts = []
+    if parent_context:
+        parts.append(parent_context)
+
+    pk_vals = ""
+    if pk_cols:
+        kv = ", ".join(f"{c}={df.at[idx, c]!r}" for c in pk_cols if c in df.columns)
+        pk_vals = f" ({kv})" if kv else ""
+
+    parts.append(f"parent row {idx}{pk_vals}, sub-entity '{entity_ref}'")
+    return " → ".join(parts)
 
 
 def resolve_sub_entity_config(

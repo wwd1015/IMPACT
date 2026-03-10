@@ -27,6 +27,7 @@ A YAML-config-driven platform for financial lending credit modeling, providing s
   - [Adding a New Source Type](#adding-a-new-source-type)
   - [Adding a New Validator](#adding-a-new-validator)
   - [Adding a New Built-in Expression](#adding-a-new-built-in-expression)
+  - [Diagnostics and Debugging](#diagnostics-and-debugging)
   - [Exception Hierarchy](#exception-hierarchy)
   - [Running Tests](#running-tests)
 
@@ -86,6 +87,12 @@ report.warning_count
 for r in report.results:
     print(r.rule_type, r.passed, r.severity, r.message)
     print(r.failing_row_count, r.failing_indices)
+    print(r.field_name)         # which field triggered the failure
+    print(r.context)            # parent row context for sub-entity validations
+    print(r.failing_samples)    # sample rows (dicts) with the bad values
+
+# Detailed diagnostic output (includes sample failing rows)
+print(report.format_detail())
 ```
 
 ---
@@ -479,7 +486,7 @@ src/impact/
 ├── common/
 │   ├── exceptions.py        # Exception hierarchy
 │   ├── logging.py           # Structured logger factory (get_logger)
-│   └── utils.py             # Shared utilities (import_dotted_path)
+│   └── utils.py             # Shared utilities, cast/lambda diagnostic helpers
 └── entity/
     ├── config/
     │   ├── schema.py        # Pydantic v2 models — single source of truth for all config shapes
@@ -693,7 +700,7 @@ type: Literal["snowflake", "parquet", "csv", "excel", "my_source"]
 1. Add a class to `src/impact/entity/validate/builtin.py` (or a new file):
 
 ```python
-from impact.entity.validate.base import ValidationResult, Validator
+from impact.entity.validate.base import ValidationResult, Validator, collect_failing_samples
 from impact.entity.validate.registry import ValidatorRegistry
 from impact.entity.config.schema import ValidationConfig
 import pandas as pd
@@ -702,14 +709,17 @@ import pandas as pd
 class MyValidator(Validator):
     def validate(self, df: pd.DataFrame, config: ValidationConfig) -> ValidationResult:
         # Available config fields: columns, column, min, max, rule, message, function, kwargs
-        passing = True  # your logic here
+        failing = []  # compute failing row indices
+        samples = collect_failing_samples(df, failing, columns=config.columns) if failing else []
         return ValidationResult(
             rule_type="my_check",
-            passed=passing,
+            passed=len(failing) == 0,
             severity=config.severity,
             message="...",
-            failing_row_count=0,
-            failing_indices=[],
+            failing_row_count=len(failing),
+            failing_indices=failing,
+            field_name=config.columns[0] if config.columns else None,
+            failing_samples=samples,
         )
 ```
 
@@ -763,6 +773,89 @@ Runtime override of a built-in expression value is done via `pipeline.run(parame
 
 ---
 
+### Diagnostics and Debugging
+
+The pipeline includes a row-level diagnostic system that pinpoints exactly which field, which row, and what value caused a failure. All diagnostic work happens only on the **error path** — the happy path has zero overhead.
+
+**What gets diagnosed:**
+
+| Failure type | Diagnostic detail |
+|---|---|
+| Cast failure | Which rows have un-castable values, the bad values themselves |
+| Lambda/derived expression error | Which row caused the lambda to throw, the row's data, the error message |
+| Validation failure (not_null, unique, range, expression) | Failing row indices + sample rows showing the bad values |
+| Sub-entity error | Parent row context (primary key values) so you can trace errors back to the parent record |
+
+**Validation results carry diagnostic data:**
+
+Each `ValidationResult` includes:
+
+```python
+result.field_name         # "commitment_amount"
+result.failing_indices    # [3, 7, 12]
+result.failing_samples    # [{"commitment_amount": -5.0}, {"commitment_amount": -3.0}, ...]
+result.context            # "parent row 3 (facility_id='FAC-001'), sub-entity 'Collateral'"
+
+# Human-readable diagnostic with sample rows
+print(result.format_detail())
+# [ERROR] range check on 'commitment_amount': >= 0 (3 failing rows)
+#   Sample failing rows:
+#     row 3: commitment_amount=-5.0
+#     row 7: commitment_amount=-3.0
+#     row 12: commitment_amount=-1.0
+```
+
+**Cast failure diagnostics** — when a dtype cast fails, the error message includes the specific rows and values that cannot be cast:
+
+```
+TransformError: field 'interest_rate': cast to 'float64' failed.
+  Bad values (first 5): row 3: 'N/A', row 7: 'TBD', row 12: 'n/a'
+```
+
+The `TransformError` also carries structured data on `.field` and `.failing_samples` attributes for programmatic inspection.
+
+**Lambda expression diagnostics** — when a row-wise lambda fails, the pipeline identifies which row caused it and includes the row's data:
+
+```
+TransformError: Field 'days_to_maturity': derived expression
+  'lambda row: (row['maturity_date'] - row['origination_date']).days' failed.
+  Failing rows: row 5: TypeError: ... (data: {maturity_date=NaT, origination_date=...})
+```
+
+**Sub-entity parent context** — when processing nested entities, errors and validation warnings include the parent row's identity:
+
+```
+TransformError: parent row 3 (facility_id='FAC-001'), sub-entity 'Collateral':
+  field 'collateral_value': cast to 'float64' failed. Bad values: row 0: 'INVALID'
+```
+
+Validation warnings from sub-entities carry the same context on `result.context`.
+
+**Full diagnostic report:**
+
+```python
+try:
+    result = pipeline.run()
+except ValidationError as exc:
+    # Detailed report with sample rows for every failed rule
+    print(exc.report.format_detail())
+```
+
+**Controlling sample count:**
+
+By default, up to 5 sample failing rows are attached to each validation result. To change this globally:
+
+```python
+from impact.entity.validate.base import set_max_samples
+
+set_max_samples(10)   # more samples for debugging
+set_max_samples(0)    # disable sample collection entirely
+```
+
+**Key files:** `src/impact/entity/validate/base.py` (ValidationResult, collect_failing_samples), `src/impact/common/utils.py` (diagnose_cast_failure, diagnose_lambda_failure).
+
+---
+
 ### Exception Hierarchy
 
 All exceptions are defined in `src/impact/common/exceptions.py`.
@@ -773,19 +866,25 @@ ImpactError
 ├── SourceError       — data source load failure
 ├── JoinError         — join execution failure
 ├── TransformError    — field expression / filter eval failure, cast failure
+│                       carries .field and .failing_samples for row-level diagnostics
 ├── ValidationError   — error-severity validation failure; carries .report attribute
+│                       .report.format_detail() for full diagnostic output
 └── EntityBuildError  — dynamic dataclass creation failure
 ```
 
-`ValidationError` carries the full `ValidationReport` on its `.report` attribute:
+**Programmatic error inspection:**
 
 ```python
 try:
     result = pipeline.run()
+except TransformError as exc:
+    print(exc.field)            # which field failed
+    print(exc.failing_samples)  # sample rows with bad values
 except ValidationError as exc:
+    print(exc.report.format_detail())   # full diagnostic with sample rows
     for r in exc.report.results:
         if not r.passed:
-            print(r.rule_type, r.severity, r.message, r.failing_indices)
+            print(r.field_name, r.failing_samples, r.context)
 ```
 
 ---

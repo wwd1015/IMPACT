@@ -30,7 +30,7 @@ src/impact/
 │   ├── model/           # Dynamic dataclass builder from YAML field definitions
 │   ├── sub_entity.py    # SubEntityProcessor + config resolver for nested entity_ref fields
 │   └── pipeline.py      # Orchestrator — ties all stages together
-└── common/              # Shared exceptions (exceptions.py), logging (logging.py), and utilities (utils.py)
+└── common/              # Shared exceptions, logging, utilities (cast/lambda diagnostics, source prefix stripping)
 ```
 
 ### Design Patterns
@@ -47,6 +47,7 @@ src/impact/
 3. **Immutability** — Transform/validation steps produce new DataFrames; inputs are never mutated.
 4. **Fail-fast** — Config is fully validated at parse time (Pydantic v2) before any data is touched.
 5. **Severity levels** — Validations use `error` (halt pipeline) or `warning` (log and continue).
+6. **Row-level diagnostics** — On failure, the pipeline identifies the exact rows and values that caused the error. Cast failures show un-castable values, lambda errors show the failing row's data, and sub-entity errors include parent row context (primary key values). All diagnostic work is error-path-only (zero overhead on success).
 
 ### YAML Config Structure
 
@@ -209,8 +210,8 @@ ImpactError
 ├── ConfigError        — invalid/missing YAML config
 ├── SourceError        — data source load failure
 ├── JoinError          — join operation failure
-├── TransformError     — transformation step failure
-├── ValidationError    — severity=error validation failure (has .report attribute)
+├── TransformError     — transformation step failure (has .field, .failing_samples)
+├── ValidationError    — severity=error validation failure (has .report; use .report.format_detail())
 └── EntityBuildError   — dynamic class creation or instantiation failure
 ```
 

@@ -16,7 +16,7 @@ import pandas as pd
 
 from impact.common.exceptions import ConfigError, SourceError, TransformError, ValidationError
 from impact.common.logging import get_logger
-from impact.common.utils import cast_and_fill, strip_source_prefixes
+from impact.common.utils import cast_and_fill, format_lambda_diagnostic, strip_source_prefixes
 from impact.entity.config.parser import ConfigParser
 from impact.entity.config.schema import EntityConfig
 from impact.entity.join.engine import JoinEngine
@@ -144,7 +144,7 @@ class EntityPipeline:
         report = self._run_field_validations(result_df, pass_filter="source")
         if report.has_errors:
             logger.error("Source field validation failed with %d errors", report.error_count)
-            raise ValidationError(report=report, message=str(report))
+            raise ValidationError(report=report, message=report.format_detail())
 
         # Pass 2: derived fields (eval → cast → fill_na), then row filters
         result_df = self._apply_derived_fields(result_df)
@@ -159,7 +159,7 @@ class EntityPipeline:
 
         if report.has_errors:
             logger.error("Validation failed with %d errors", report.error_count)
-            raise ValidationError(report=report, message=str(report))
+            raise ValidationError(report=report, message=report.format_detail())
 
         if report.has_warnings:
             logger.warning("Validation completed with %d warnings", report.warning_count)
@@ -340,7 +340,6 @@ class EntityPipeline:
         Supports pandas expressions and row-wise lambdas.
         """
         result = df
-        caster = self._caster
         for field in self.config.fields:
             if field.derived is None:
                 continue
@@ -352,9 +351,14 @@ class EntityPipeline:
                 else:
                     result[field.name] = result.eval(expr)
             except Exception as exc:
+                diag, samples = "", []
+                if expr.startswith("lambda"):
+                    diag, samples = format_lambda_diagnostic(result, fn)
                 raise TransformError(
-                    f"Field '{field.name}': failed to evaluate derived expression "
-                    f"'{field.derived}': {exc}"
+                    f"Field '{field.name}': derived expression "
+                    f"'{field.derived}' failed: {exc}.{diag}",
+                    field=field.name,
+                    failing_samples=samples,
                 ) from exc
             logger.info("  Field '%s': derived from expression", field.name)
             result = cast_and_fill(result, field.name, field.dtype, field.fill_na, self._caster)
@@ -377,11 +381,16 @@ class EntityPipeline:
             for v_cfg in field.build_validation_configs(pass_filter=pass_filter):
                 validator = ValidatorRegistry.get(v_cfg.type)
                 result = validator.validate(df, v_cfg)
+                result.field_name = result.field_name or field.name
                 report.results.append(result)
                 status = "PASS" if result.passed else result.severity.upper()
                 logger.info(
                     "  Field '%s' [%s] %s: %s", field.name, status, v_cfg.type, result.message
                 )
+                if not result.passed and result.failing_samples:
+                    for sample in result.failing_samples[:3]:
+                        vals = ", ".join(f"{k}={v!r}" for k, v in sample.items())
+                        logger.info("    ↳ sample: %s", vals)
 
         return report
 

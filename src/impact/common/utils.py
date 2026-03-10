@@ -61,6 +61,10 @@ def cast_and_fill(
 ) -> pd.DataFrame:
     """Apply dtype cast then fill_na for a single field.
 
+    On cast failure, runs a diagnostic pass to identify the specific rows and
+    values that cannot be cast — included in the error message and on the
+    ``TransformError.failing_samples`` attribute.
+
     Args:
         df: DataFrame to modify.
         field_name: Column to cast/fill.
@@ -76,9 +80,102 @@ def cast_and_fill(
             cast_cfg = TransformConfig(type="cast", columns={field_name: dtype})
             df = caster.apply(df, cast_cfg)
         except Exception as exc:
+            bad_rows = diagnose_cast_failure(df, field_name, dtype)
+            detail = ""
+            if bad_rows:
+                detail = " Bad values (first 5): " + ", ".join(
+                    f"row {idx}: {val!r}" for idx, val in bad_rows
+                )
             raise TransformError(
-                f"{error_context}field '{field_name}': cast to '{dtype}' failed: {exc}"
+                f"{error_context}field '{field_name}': cast to '{dtype}' failed.{detail}",
+                field=field_name,
+                failing_samples=[{"row": idx, field_name: val} for idx, val in bad_rows],
             ) from exc
     if fill_na is not None and field_name in df.columns:
         df[field_name] = df[field_name].fillna(fill_na)
     return df
+
+
+def diagnose_cast_failure(
+    df: pd.DataFrame, field_name: str, dtype: str, max_samples: int = 5,
+) -> list[tuple[int, Any]]:
+    """Identify rows with values that cannot be cast to the target dtype.
+
+    Uses vectorized coercion where possible (``pd.to_numeric``, ``pd.to_datetime``).
+    Only called on the error path — zero cost when casts succeed.
+
+    Returns:
+        List of ``(row_index, bad_value)`` tuples, up to ``max_samples``.
+    """
+    if field_name not in df.columns:
+        return []
+
+    col = df[field_name]
+
+    if dtype in ("float32", "float64", "int32", "int64"):
+        coerced = pd.to_numeric(col, errors="coerce")
+        bad_mask = coerced.isna() & col.notna()
+    elif dtype == "datetime":
+        coerced = pd.to_datetime(col, errors="coerce")
+        bad_mask = coerced.isna() & col.notna()
+    elif dtype in ("bool",):
+        try:
+            col.astype("bool")
+            return []
+        except (ValueError, TypeError):
+            bad_mask = pd.Series(True, index=col.index)
+    elif dtype in ("str", "string"):
+        return []  # anything can be cast to string
+    else:
+        bad_mask = pd.Series(False, index=col.index)
+
+    bad_indices = col.index[bad_mask].tolist()[:max_samples]
+    return [(idx, col.loc[idx]) for idx in bad_indices]
+
+
+def format_lambda_diagnostic(
+    df: pd.DataFrame, fn: Any,
+) -> tuple[str, list[dict[str, Any]]]:
+    """Diagnose a failed row-wise lambda and return a formatted message + samples.
+
+    Only called on the error path. Returns ``("", [])`` if no row-level
+    failures can be identified.
+    """
+    failures = diagnose_lambda_failure(df, fn)
+    if not failures:
+        return "", []
+    parts = [
+        f"row {idx}: {err} (data: {data})"
+        for idx, data, err in failures
+    ]
+    diag = " Failing rows: " + "; ".join(parts)
+    samples = [{"row": idx, **data} for idx, data, _ in failures]
+    return diag, samples
+
+
+def diagnose_lambda_failure(
+    df: pd.DataFrame, fn: Any, max_samples: int = 3,
+) -> list[tuple[int, dict[str, Any], str]]:
+    """Find the rows where a row-wise lambda fails.
+
+    Iterates rows one-by-one (only called on the error path) and returns
+    the first ``max_samples`` failures.
+
+    Returns:
+        List of ``(row_index, row_data_dict, error_message)`` tuples.
+    """
+    failures: list[tuple[int, dict[str, Any], str]] = []
+    for idx in df.index:
+        try:
+            fn(df.loc[idx])
+        except Exception as exc:
+            row_data = df.loc[idx].to_dict()
+            # Truncate row data to avoid enormous output
+            truncated = {
+                k: (repr(v)[:80] + "..." if len(repr(v)) > 80 else v)
+                for k, v in row_data.items()
+            }
+            failures.append((idx, truncated, str(exc)))
+            if len(failures) >= max_samples:
+                break
+    return failures

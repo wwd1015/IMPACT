@@ -10,7 +10,7 @@ import pandas as pd
 from impact.common.logging import get_logger
 from impact.common.utils import import_dotted_path
 from impact.entity.config.schema import ValidationConfig
-from impact.entity.validate.base import ValidationResult, Validator
+from impact.entity.validate.base import ValidationResult, Validator, collect_failing_samples
 from impact.entity.validate.registry import ValidatorRegistry
 
 logger = get_logger(__name__)
@@ -35,6 +35,8 @@ class NotNullValidator(Validator):
         null_mask = df[config.columns].isnull().any(axis=1)
         failing = df.index[null_mask].tolist()
 
+        samples = collect_failing_samples(df, failing, columns=config.columns) if failing else []
+
         return ValidationResult(
             rule_type="not_null",
             passed=len(failing) == 0,
@@ -42,6 +44,8 @@ class NotNullValidator(Validator):
             message=f"not_null check on columns {config.columns}",
             failing_row_count=len(failing),
             failing_indices=failing,
+            field_name=config.columns[0] if len(config.columns) == 1 else None,
+            failing_samples=samples,
         )
 
 
@@ -64,6 +68,8 @@ class UniqueValidator(Validator):
         duplicated = df.duplicated(subset=config.columns, keep=False)
         failing = df.index[duplicated].tolist()
 
+        samples = collect_failing_samples(df, failing, columns=config.columns) if failing else []
+
         return ValidationResult(
             rule_type="unique",
             passed=len(failing) == 0,
@@ -71,6 +77,8 @@ class UniqueValidator(Validator):
             message=f"unique check on columns {config.columns}",
             failing_row_count=len(failing),
             failing_indices=failing,
+            field_name=config.columns[0] if len(config.columns) == 1 else None,
+            failing_samples=samples,
         )
 
 
@@ -104,6 +112,11 @@ class RangeValidator(Validator):
 
         failing = df.index[~mask].tolist()
 
+        samples = (
+            collect_failing_samples(df, failing, columns=[config.column])
+            if failing else []
+        )
+
         bounds = []
         if config.min is not None:
             op = ">" if config.min_exclusive else ">="
@@ -120,6 +133,8 @@ class RangeValidator(Validator):
             message=f"range check on '{config.column}': {bounds_str}",
             failing_row_count=len(failing),
             failing_indices=failing,
+            field_name=config.column,
+            failing_samples=samples,
         )
 
 
@@ -152,6 +167,10 @@ class ExpressionValidator(Validator):
         failing = df.index[~mask].tolist()
         msg = config.message or f"expression: {config.rule}"
 
+        # Include only columns referenced in the expression rule
+        expr_cols = [c for c in df.columns if c in config.rule] if failing else []
+        samples = collect_failing_samples(df, failing, columns=expr_cols or None) if failing else []
+
         return ValidationResult(
             rule_type="expression",
             passed=len(failing) == 0,
@@ -159,6 +178,7 @@ class ExpressionValidator(Validator):
             message=msg,
             failing_row_count=len(failing),
             failing_indices=failing,
+            failing_samples=samples,
         )
 
 
