@@ -1,28 +1,16 @@
-# Sub-entity config for Facility — nested inside Obligor.facilities
-# Referenced by entity_ref: Facility in the obligor config.
-# When used as a sub-entity, sources/joins/filters are ignored —
-# data comes from the parent's one-to-many join.
+# ---------------------------------------------------------------------------
+# Facility sub-entity config — defines the schema for nested Facility
+# DataFrames inside Obligor.facilities.
+#
+# This is NOT a standalone pipeline config. It defines only entity + fields
+# for sub-entity processing. The data comes from the parent (Obligor)
+# pipeline's one-to-many join.
+# ---------------------------------------------------------------------------
 
 entity:
   name: Facility
-  description: "Commercial lending facility entity"
+  description: "Commercial lending facility entity (sub-entity schema)"
   version: "1.0"
-
-# Sources listed here allow source-prefix stripping in field references.
-# The actual data comes from the parent entity's join, not these sources.
-sources:
-  - name: facility_main
-    type: csv
-    primary: true
-    path: "data/sample/facility_main.csv"
-
-  - name: collateral
-    type: parquet
-    path: "data/sample/collateral.parquet"
-
-  - name: rating_overrides
-    type: csv
-    path: "data/sample/rating_overrides.csv"
 
 fields:
   - name: facility_id
@@ -33,10 +21,6 @@ fields:
     validation_severity:
       not_null: error
       unique: error
-
-  - name: obligor_id
-    source: obligor_id
-    dtype: str
 
   - name: product_category
     source: product_type
@@ -70,7 +54,7 @@ fields:
     dtype: datetime
 
   - name: rating_override
-    source: rating_overrides.rating_override
+    source: rating_override
     dtype: str
 
   - name: collateral_items
@@ -78,17 +62,8 @@ fields:
     dtype: nested
     entity_ref: Collateral
 
-  - name: available_capacity
-    source: "facility_main.commitment_amount - facility_main.outstanding_balance"
-    dtype: float64
-    temp: true
-
   - name: utilization_rate
     derived: "outstanding_balance / commitment_amount"
-    dtype: float64
-
-  - name: capacity_utilization
-    derived: "1 - available_capacity / commitment_amount"
     dtype: float64
 
   - name: total_collateral_value

@@ -312,8 +312,10 @@ def resolve_sub_entity_config(
 ) -> EntityConfig:
     """Resolve and parse a sub-entity config by entity_ref name.
 
-    Looks for ``{snake_case(entity_ref)}_example.yaml`` or
-    ``{snake_case(entity_ref)}.yaml`` in the same directory as the parent config.
+    Searches the parent config's directory for any YAML file matching
+    ``{snake_case(entity_ref)}_*.yaml`` or ``{snake_case(entity_ref)}.yaml``.
+    For example, ``entity_ref: Collateral`` matches ``collateral_demo.yaml``,
+    ``collateral_example.yaml``, ``collateral.yaml``, etc.
 
     Args:
         entity_ref: The entity_ref value (e.g. ``"Collateral"``).
@@ -334,29 +336,45 @@ def resolve_sub_entity_config(
         )
 
     config_dir = parent_config_path.parent
-
-    # Convert CamelCase to snake_case
     snake_name = _camel_to_snake(entity_ref)
+    lower_name = entity_ref.lower()
 
-    # Try common naming conventions
-    candidates = [
-        config_dir / f"{snake_name}.yaml",
-        config_dir / f"{snake_name}_example.yaml",
-        config_dir / f"{entity_ref.lower()}.yaml",
-        config_dir / f"{entity_ref.lower()}_example.yaml",
-    ]
+    # Collect candidate files: exact match first, then glob
+    prefixes = sorted({snake_name, lower_name})  # deduplicate if same
+    candidate_paths: list[Path] = []
+    for prefix in prefixes:
+        exact = config_dir / f"{prefix}.yaml"
+        if exact.exists():
+            candidate_paths.append(exact)
+        candidate_paths.extend(sorted(config_dir.glob(f"{prefix}_*.yaml")))
 
-    for candidate in candidates:
-        if candidate.exists():
-            logger.info(
-                "Resolved sub-entity '%s' config: %s", entity_ref, candidate
-            )
-            return ConfigParser().parse(candidate)
+    if not candidate_paths:
+        raise ConfigError(
+            f"Sub-entity config for '{entity_ref}' not found in {config_dir}. "
+            f"Expected a file matching '{snake_name}.yaml' or '{snake_name}_*.yaml'."
+        )
 
-    raise ConfigError(
-        f"Sub-entity config for '{entity_ref}' not found. "
-        f"Searched: {[str(c) for c in candidates]}"
-    )
+    # Parse candidates; prefer configs without sources (sub-entity configs)
+    parsed: list[tuple[Path, EntityConfig]] = []
+    for path in candidate_paths:
+        try:
+            cfg = ConfigParser().parse(path)
+        except Exception:
+            continue
+        parsed.append((path, cfg))
+
+    if not parsed:
+        raise ConfigError(
+            f"Sub-entity config for '{entity_ref}': found files {candidate_paths} "
+            "but none could be parsed."
+        )
+
+    # Prefer sub-entity configs (no sources) over standalone pipeline configs
+    sub_entity_configs = [(p, c) for p, c in parsed if not c.sources]
+    chosen_path, chosen_cfg = (sub_entity_configs or parsed)[0]
+
+    logger.info("Resolved sub-entity '%s' config: %s", entity_ref, chosen_path)
+    return chosen_cfg
 
 
 def _camel_to_snake(name: str) -> str:
