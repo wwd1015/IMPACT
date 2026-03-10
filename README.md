@@ -20,6 +20,7 @@ A YAML-config-driven platform for financial lending credit modeling, providing s
     - [filters](#filters)
     - [fields](#fields)
     - [validations](#validations)
+  - [Config Merge — Custom Overrides](#config-merge--custom-overrides)
 - [Developer Guide](#developer-guide)
   - [Architecture](#architecture)
   - [Pipeline Execution Order](#pipeline-execution-order)
@@ -472,6 +473,92 @@ validations:
       threshold: 0.25
     severity: error
 ```
+
+---
+
+### Config Merge — Custom Overrides
+
+IMPACT provides standardized configs that define the primary data processing logic. Users can create custom override configs to add or replace specific sections without duplicating the entire config. The merge happens at the YAML level before parsing — the IMPACT config is always the primary base.
+
+```python
+from impact.entity.config.merger import merge_configs
+
+# IMPACT config is always the primary, regardless of argument order
+config = merge_configs(
+    primary="configs/facility_example.yaml",     # IMPACT standard config
+    custom="user_configs/facility_custom.yaml",  # user's sparse overrides
+)
+
+# Use the merged config in the pipeline
+result = EntityPipeline(config=config).run()
+```
+
+**Merge semantics by section:**
+
+| Section | Strategy | Example |
+|---|---|---|
+| `entity` | Custom overrides individual keys | Change `version` without touching `name` |
+| `parameters` | Dict merge, custom wins on conflict | Override `active_product` while keeping `snapshot_date` |
+| `sources` | Merge by `name`; same name = replace entirely; new = added | Swap a Snowflake source for CSV in dev |
+| `joins` | Merge by `(left, right)` pair; same pair = replace; new = added | Change join type or add new joins |
+| `filters` | Custom filters appended to primary's | Add stricter data-quality gates |
+| `fields` | Merge by `name`; same name = replace entirely; new = added | Override a field's dtype, source, or validation |
+| `validations` | Custom validations appended to primary's | Add extra validation rules |
+
+**Example custom config** — only includes what's different:
+
+```yaml
+# user_configs/facility_custom.yaml
+# Sparse override — only the sections/fields you want to change
+
+parameters:
+  active_product: "REVOLVER"          # override default TERM_LOAN
+
+sources:
+  - name: collateral                   # replaces the primary's 'collateral' source
+    type: csv
+    path: "./data/collateral_local.csv" # use local CSV instead of Parquet
+
+fields:
+  # Override: change the commitment_amount validation to be stricter
+  - name: commitment_amount
+    source: commitment_amount
+    dtype: float64
+    validation_type: [not_null, range]
+    validation_rule:
+      range: (0, null]                  # exclusive lower bound (must be > 0)
+    validation_severity:
+      not_null: error
+      range: error                      # upgrade from warning to error
+
+  # Addition: new field not in the primary config
+  - name: region
+    source: region_code
+    dtype: str
+    fill_na: "UNKNOWN"
+
+filters:
+  - "region != 'EXCLUDED'"             # appended to primary's filters
+```
+
+**Merge logging** — the merger logs every adjustment so users can verify the effect:
+
+```
+INFO | [merge] parameters: overridden: ['active_product']
+INFO | [merge] sources: overridden: ['collateral']
+INFO | [merge] fields: overridden: ['commitment_amount']
+INFO | [merge] fields: added: ['region']
+INFO | [merge] filters: appended 1 custom entries
+```
+
+**Key design principles:**
+
+- The IMPACT config is **always** the primary base — argument order doesn't matter
+- Custom configs are **sparse** — only include what you want to change
+- **Fields replaced entirely** — if you override a field, the custom definition replaces the primary's completely (including its validations). This avoids ambiguity about which validations apply
+- **No removal** — the custom config can only override or add, not remove sections from the primary
+
+**Key file:** `src/impact/entity/config/merger.py`
 
 ---
 

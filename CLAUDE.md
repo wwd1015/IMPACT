@@ -22,7 +22,7 @@ All pipeline logic is declared in a single YAML config file. Python code is the 
 ```
 src/impact/
 ├── entity/
-│   ├── config/          # Pydantic v2 schema + YAML parser (env-var interpolation)
+│   ├── config/          # Pydantic v2 schema, YAML parser, config merger (primary + custom override)
 │   ├── source/          # Data connectors: Snowflake, Parquet, CSV, Excel
 │   ├── join/            # Join engine with nested DataFrame support (1-to-many)
 │   ├── transform/       # 7 built-in types: cast, rename, derive, fill_na, drop, filter, custom
@@ -48,6 +48,7 @@ src/impact/
 4. **Fail-fast** — Config is fully validated at parse time (Pydantic v2) before any data is touched.
 5. **Severity levels** — Validations use `error` (halt pipeline) or `warning` (log and continue).
 6. **Row-level diagnostics** — On failure, the pipeline identifies the exact rows and values that caused the error. Cast failures show un-castable values, lambda errors show the failing row's data, and sub-entity errors include parent row context (primary key values). All diagnostic work is error-path-only (zero overhead on success).
+7. **Config merge** — IMPACT provides standardized primary configs. Users create sparse custom configs that are merged before parsing. Fields/sources/joins merge by key (custom replaces same-key); filters/validations are appended. Use `merge_configs(primary=..., custom=...)` from `impact.entity.config.merger`.
 
 ### YAML Config Structure
 
