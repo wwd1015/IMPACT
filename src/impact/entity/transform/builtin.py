@@ -51,23 +51,27 @@ class CastTransformer(Transformer):
 
         result = df.copy()
         for col, dtype_str in config.columns.items():
-            if col not in result.columns:
-                raise TransformError(f"Column '{col}' not found for casting")
-
-            target_dtype = self._DTYPE_MAP.get(dtype_str, dtype_str)
-
-            try:
-                if target_dtype == "datetime64[ns]":
-                    result[col] = pd.to_datetime(result[col])
-                else:
-                    result[col] = result[col].astype(target_dtype)
-            except Exception as exc:
-                raise TransformError(
-                    f"Failed to cast column '{col}' to '{dtype_str}': {exc}"
-                ) from exc
+            self.cast_column(result, col, dtype_str)
 
         logger.info("Cast %d columns", len(config.columns))
         return result
+
+    def cast_column(self, df: pd.DataFrame, col: str, dtype_str: str) -> None:
+        """Cast a single column in-place. No DataFrame copy."""
+        if col not in df.columns:
+            raise TransformError(f"Column '{col}' not found for casting")
+
+        target_dtype = self._DTYPE_MAP.get(dtype_str, dtype_str)
+
+        try:
+            if target_dtype == "datetime64[ns]":
+                df[col] = pd.to_datetime(df[col])
+            else:
+                df[col] = df[col].astype(target_dtype)
+        except Exception as exc:
+            raise TransformError(
+                f"Failed to cast column '{col}' to '{dtype_str}': {exc}"
+            ) from exc
 
 
 # ---------------------------------------------------------------------------

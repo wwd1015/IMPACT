@@ -178,7 +178,7 @@ class SubEntityProcessor:
     def _apply_source_fields(
         self, df: pd.DataFrame, fields: list[FieldConfig],
     ) -> pd.DataFrame:
-        """Pass 1 — rename/expr → cast → fill_na for source fields."""
+        """Pass 1 — copy/expr → cast → fill_na for source fields."""
         result = df
         source_prefixes = {s.name for s in self.config.sources}
         err_ctx = f"Sub-entity '{self.config.entity.name}', "
@@ -188,16 +188,14 @@ class SubEntityProcessor:
             for f in fields if f.source is not None
         }
 
-        # Batch renames
-        rename_map: dict[str, str] = {}
+        # Copy columns (originals preserved for derived field access)
         for field in fields:
             if field.source is None:
                 continue
             stripped = stripped_map[field.name]
             if stripped.isidentifier() and stripped != field.name and stripped in result.columns:
-                rename_map[stripped] = field.name
-        if rename_map:
-            result = result.rename(columns=rename_map)
+                result[field.name] = result[stripped]
+                logger.info("  Field '%s': copied from '%s'", field.name, stripped)
 
         # Per field: expression eval → cast → fill_na
         for field in fields:

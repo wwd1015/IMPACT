@@ -73,12 +73,9 @@ def cast_and_fill(
         caster: A ``CastTransformer`` instance.
         error_context: Prefix for error messages (e.g. ``"Sub-entity 'X', "``).
     """
-    from impact.entity.config.schema import TransformConfig
-
     if dtype != "nested" and field_name in df.columns:
         try:
-            cast_cfg = TransformConfig(type="cast", columns={field_name: dtype})
-            df = caster.apply(df, cast_cfg)
+            caster.cast_column(df, field_name, dtype)
         except Exception as exc:
             bad_rows = diagnose_cast_failure(df, field_name, dtype)
             detail = ""

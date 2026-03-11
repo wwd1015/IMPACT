@@ -312,14 +312,15 @@ class EntityPipeline:
     def _apply_source_fields(
         self, df: pd.DataFrame, parameters: dict[str, Any] | None = None,
     ) -> pd.DataFrame:
-        """Pass 1 — process all source fields: rename/expr → cast → fill_na.
+        """Pass 1 — process all source fields: copy/expr → cast → fill_na.
 
         ``source`` accepts two forms (source-name prefixes are stripped automatically):
-        - Column reference: ``'col'`` or ``'src_name.col'`` — pass-through or rename.
+        - Column reference: ``'col'`` or ``'src_name.col'`` — pass-through or copy to new name.
         - Expression: ``'src_name.col_a * 0.95'`` — evaluated via ``df.eval()``.
 
-        All renames are batched into a single ``rename()`` call before any
-        expression sources or per-field cast/fill_na are applied.
+        Column references with a different name create a **copy** (not a rename),
+        so the original column remains available for derived fields in Pass 2.
+        Only fields declared in the config are kept in the final entity.
 
         Parameters are available in expressions via ``@param_name`` syntax.
         """
@@ -333,8 +334,7 @@ class EntityPipeline:
             for f in self.config.fields if f.source is not None
         }
 
-        # Batch renames first (avoids N DataFrame copies)
-        rename_map: dict[str, str] = {}
+        # Batch copy columns (original columns preserved for derived field access)
         for field in self.config.fields:
             if field.source is None:
                 continue
@@ -344,11 +344,8 @@ class EntityPipeline:
                     raise TransformError(
                         f"Field '{field.name}': source column '{stripped}' not found in DataFrame"
                     )
-                rename_map[stripped] = field.name
-        if rename_map:
-            result = result.rename(columns=rename_map)
-            for old, new in rename_map.items():
-                logger.info("  Field '%s': renamed from '%s'", new, old)
+                result[field.name] = result[stripped]
+                logger.info("  Field '%s': copied from '%s'", field.name, stripped)
 
         # Per source field: expression eval → cast → fill_na
         for field in self.config.fields:

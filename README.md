@@ -138,6 +138,17 @@ connection:
   warehouse: "${SNOWFLAKE_WH:ANALYTICS_WH}"  # optional — falls back to ANALYTICS_WH if unset
 ```
 
+**Variable reference syntax** — the pipeline uses three distinct syntaxes depending on context:
+
+| Syntax | Context | What it references | Example |
+|---|---|---|---|
+| `${VAR}` | Any YAML string value | Environment variable (resolved at config parse time) | `account: "${SNOWFLAKE_ACCOUNT}"` |
+| `{param}` | SQL `query` in SQLite/Snowflake sources | Parameter value (string-interpolated before query execution) | `FROM {source_table} WHERE date = '{snapshot_date}'` |
+| `@param` | `pre_filters`, `post_filters`, source/derived `eval` expressions | External parameter (not a DataFrame column) | `"amount * @scale_factor"`, `"amount >= @min_amount"` |
+| `row['col']` | `derived` lambda expressions | DataFrame column value for the current row | `"lambda row: row['amount'] * scale"` — `row['amount']` is a column, `scale` is a parameter |
+
+In pandas eval expressions (`source`, `derived`, filters), bare names like `amount` refer to **DataFrame columns**. The `@` prefix distinguishes **external parameters** from columns. In lambda expressions, `row['col']` accesses columns and bare names like `scale` are parameters from the `parameters` dict.
+
 ---
 
 #### `connections`
@@ -359,10 +370,10 @@ Defines the output entity class. Each field declares its data origin, type, fill
 | Pass | Origin | Steps |
 |---|---|---|
 | Pre-filters | — | `pre_filters:` applied after joins, before field processing (raw column names) |
-| Pass 1 | `source` | rename / expression eval → cast → fill_na → validation |
-| Pass 2 | `derived` | expression eval → cast → fill_na → validation |
+| Pass 1 | `source` | copy / expression eval → cast → fill_na → validation (original columns preserved) |
+| Pass 2 | `derived` | expression eval → cast → fill_na → validation (full DataFrame available: original + source columns) |
 | Post-filters | — | `post_filters:` applied after field processing (processed field names) |
-| Post | — | `temp` fields dropped, entity class built |
+| Post | — | Only config-defined fields kept; `temp: true` fields excluded; entity class built |
 
 **Every field requires exactly one of `source` or `derived`.**
 
@@ -410,9 +421,9 @@ fields:
   source: facility_id
   dtype: str
 
-# Rename — maps source column name to a different field name
+# Copy — maps source column to a new field name (original column preserved)
 - name: product_category
-  source: product_type        # renames product_type → product_category
+  source: product_type        # copies product_type → product_category; product_type still available
   dtype: str
 
 # Non-primary source column — src_name.col_name format required
@@ -440,7 +451,7 @@ fields:
 
 **`derived` — Pass 2 field (computed after all source fields are clean)**
 
-Derived fields run after Pass 1 source fields are fully renamed, cast, filled, and validated. Reference field names only — no `src_name.` prefix.
+Derived fields run after Pass 1 and have access to the **full DataFrame** — all original source columns plus any new source fields. No `src_name.` prefix needed; use column names directly.
 
 ```yaml
 # pandas eval expression
@@ -687,11 +698,11 @@ EntityPipeline.run(parameters)
 ├── Stage 3 — Field processing
 │   │
 │   ├── Pass 1 — source fields
-│   │       Batch rename (single rename() call for all source renames)
+│   │       Copy columns (originals preserved for Pass 2 access)
 │   │       Per field: source expression eval → cast → fill_na
 │   │       Source field validations → halt on any error-severity failure
 │   │
-│   └── Pass 2 — derived fields
+│   └── Pass 2 — derived fields (full DataFrame: original + source columns)
 │               Per field: df.eval(expr, local_dict=params) or lambda (params in namespace)
 │
 ├── Stage 3b — Post-filters (processed field names)
@@ -706,7 +717,7 @@ EntityPipeline.run(parameters)
 │       For each nested field with entity_ref:
 │         Resolve sub-entity config (convention-based file lookup)
 │         Process each cell's DataFrame through SubEntityProcessor
-│           (rename → cast → fill_na → validate → derived → build)
+│           (copy → cast → fill_na → validate → derived → build)
 │         Replace nested DataFrame cells with list[SubEntity]
 │         Merge sub-entity validation results into parent report
 │
@@ -728,7 +739,7 @@ When a field has `dtype: nested` and `entity_ref` set, the pipeline automaticall
 
 1. The parent pipeline's one-to-many join produces a nested `pd.DataFrame` in each cell of the nested column (e.g. `collateral_items`).
 2. After parent validations pass, the pipeline resolves the sub-entity config by convention — it looks for `{snake_case(entity_ref)}.yaml` or `{snake_case(entity_ref)}_*.yaml` in the same directory as the parent config.
-3. Each cell's DataFrame is processed through `SubEntityProcessor`, which applies the same two-pass field processing as the main pipeline (rename → cast → fill_na → validate → derived → build), but without sources, joins, or filters (pre/post).
+3. Each cell's DataFrame is processed through `SubEntityProcessor`, which applies the same two-pass field processing as the main pipeline (copy → cast → fill_na → validate → derived → build), but without sources, joins, or filters (pre/post).
 4. The nested DataFrame cells are replaced with `list[SubEntity]` — each element is a dataclass instance of the sub-entity type.
 5. Sub-entity validation results are merged into the parent's `ValidationReport`.
 
@@ -876,46 +887,6 @@ ValidationTypeLiteral = Literal["not_null", "unique", "range", "expression", "cu
 ```
 
 No import change needed in `pipeline.py` — `validate/builtin.py` is already imported at startup.
-
----
-
-### Adding a New Built-in Expression
-
-The config parser supports `${name}` interpolation in any YAML string value. In addition to environment variables (`${SNOWFLAKE_ACCOUNT}`), you can register **built-in expressions** that compute a value dynamically at parse time. These are defined in `_BUILTIN_EXPRESSIONS` in `src/impact/entity/config/parser.py`:
-
-```python
-# Currently available:
-#   ${last_quarter_end}  — e.g. "2025-09-30"
-
-# To add a new one:
-def _last_month_end() -> str:
-    from datetime import date, timedelta
-    first_of_month = date.today().replace(day=1)
-    return (first_of_month - timedelta(days=1)).strftime("%Y-%m-%d")
-
-_BUILTIN_EXPRESSIONS: dict[str, Any] = {
-    "last_quarter_end": _last_quarter_end,
-    "last_month_end": _last_month_end,     # new
-}
-```
-
-Usage in config:
-
-```yaml
-parameters:
-  snapshot_date: "${last_quarter_end}"   # resolved at parse time; overridden by pipeline.run(parameters=...)
-```
-
-**Resolution priority** for `${name}` tokens:
-
-| Priority | Mechanism | Intended for |
-|---|---|---|
-| 1 (highest) | Built-in expression | Dynamic computed defaults (`${last_quarter_end}`) |
-| 2 | Environment variable | Infrastructure values (`${SNOWFLAKE_ACCOUNT}`) |
-| 3 | Inline default after `:` | Static fallback (`${VAR:ANALYTICS_WH}`) |
-| 4 (lowest) | Placeholder left as-is | Pydantic will surface it as an error if the field is required |
-
-Runtime override of a built-in expression value is done via `pipeline.run(parameters={"snapshot_date": "..."})`, not via environment variables.
 
 ---
 

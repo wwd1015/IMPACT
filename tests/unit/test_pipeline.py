@@ -236,3 +236,67 @@ class TestParametersInExpressions:
 
         result = EntityPipeline(config=config).run()
         assert list(result.dataframe["calc"]) == [210.0, 410.0, 610.0]
+
+
+class TestDerivedAccessToFullDataFrame:
+    """Test that derived fields can access all DataFrame columns, not just declared fields."""
+
+    def test_derived_uses_undeclared_source_column(self, tmp_dir):
+        """Derived field can reference a raw source column not declared in fields."""
+        import pandas as pd
+
+        csv_path = tmp_dir / "data.csv"
+        pd.DataFrame({
+            "id": ["A", "B"],
+            "amount": [100.0, 200.0],
+            "hidden_rate": [0.05, 0.10],  # not declared in fields
+        }).to_csv(csv_path, index=False)
+
+        config_dict = {
+            "entity": {"name": "TestEntity"},
+            "sources": [{"name": "main", "type": "csv", "primary": True, "path": str(csv_path)}],
+            "fields": [
+                {"name": "id", "source": "id", "dtype": "str", "primary_key": True},
+                {"name": "amount", "source": "amount", "dtype": "float64"},
+                # hidden_rate is NOT declared — but derived can still use it
+                {"name": "interest", "derived": "amount * hidden_rate", "dtype": "float64"},
+            ],
+        }
+        config = EntityConfig.model_validate(config_dict)
+        result = EntityPipeline(config=config).run()
+        assert list(result.dataframe["interest"]) == [5.0, 20.0]
+        # hidden_rate should NOT appear in the final entity
+        assert not hasattr(result.entities[0], "hidden_rate")
+
+    def test_derived_uses_original_after_copy(self, tmp_dir):
+        """After a source field copies a column, the original is still accessible."""
+        import pandas as pd
+
+        csv_path = tmp_dir / "data.csv"
+        pd.DataFrame({
+            "id": ["A", "B"],
+            "product_type": ["LOAN", "REVOLVER"],
+            "amount": [100.0, 200.0],
+        }).to_csv(csv_path, index=False)
+
+        config_dict = {
+            "entity": {"name": "TestEntity"},
+            "sources": [{"name": "main", "type": "csv", "primary": True, "path": str(csv_path)}],
+            "fields": [
+                {"name": "id", "source": "id", "dtype": "str", "primary_key": True},
+                {"name": "product_category", "source": "product_type", "dtype": "str"},
+                # Use the ORIGINAL column name in a derived expression
+                {
+                    "name": "is_loan",
+                    "derived": "lambda row: row['product_type'] == 'LOAN'",
+                    "dtype": "bool",
+                },
+            ],
+        }
+        config = EntityConfig.model_validate(config_dict)
+        result = EntityPipeline(config=config).run()
+        assert result.entities[0].product_category == "LOAN"
+        assert result.entities[0].is_loan is True
+        assert result.entities[1].is_loan is False
+        # Original column not in final entity
+        assert not hasattr(result.entities[0], "product_type")

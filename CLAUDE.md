@@ -118,13 +118,14 @@ fields:
     #   Two forms (src_name. prefix always stripped automatically):
     source: <col>                # column ref — PRIMARY source: bare name, same → pass-through,
     source: <src_name>.<col>     #              NON-PRIMARY source: src_name.col required.
-                                 #              different col name → rename.
+                                 #              different col name → copy (original preserved).
     source: "<expression>"       # expression — evaluated via df.eval(); src_name.col notation
                                  #              works and is stripped before evaluation.
                                  #              e.g. "col_a - col_b" (primary source prefix optional)
     #
-    # derived — processed in Pass 2, after ALL source fields are renamed, cast,
-    #           filled, and validated. Use field names only — no src_name prefix.
+    # derived — processed in Pass 2, after ALL source fields are copied, cast,
+    #           filled, and validated. Has access to the full DataFrame (all
+    #           original columns + source fields). No src_name prefix needed.
     derived: "<expression>"      #   pandas expression: "col_a / col_b"
                                  #   row-wise lambda:   "lambda row: row['a'] * 2"
                                  #   Parameters: use @param in eval, variable name in lambda
@@ -162,16 +163,16 @@ fields:
 | Pass | Step | What happens |
 |---|---|---|
 | **Pre-filters** | row filters | `pre_filters:` applied after joins, before field processing (raw column names) |
-| **Pass 1** — source | rename / expression | Batch rename, then evaluate source expressions |
+| **Pass 1** — source | copy / expression | Copy source columns (originals preserved), then evaluate source expressions |
 | | dtype cast | Cast to declared type |
 | | fill_na | Fill NAs |
 | | source validations | Validate source fields (halt on error before derived runs) |
-| **Pass 2** — derived | expression / lambda | Evaluate using field names (no src_name prefix needed) |
+| **Pass 2** — derived | expression / lambda | Full DataFrame available (original + source columns); no src_name prefix needed |
 | | dtype cast + fill_na | Cast and fill derived columns |
 | **Post-filters** | row filters | `post_filters:` applied after field processing (processed field names) |
 | Validations | derived + global validations | Validate derived fields and any global rules |
 | **Sub-entities** | entity_ref processing | Nested DataFrames validated/transformed → `list[SubEntity]` |
-| **Build** | drop temp fields | Fields with `temp: true` removed from entity class |
+| **Build** | select & drop | Only config-defined fields kept; `temp: true` fields excluded from entity class |
 | | entity class | Built from remaining (non-temp) fields; nested fields typed as `list` |
 
 ### Extending the System

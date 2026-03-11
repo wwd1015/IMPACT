@@ -7,8 +7,6 @@ from __future__ import annotations
 
 import os
 import re
-from calendar import monthrange
-from datetime import date
 from pathlib import Path
 from typing import Any
 
@@ -22,25 +20,6 @@ logger = get_logger(__name__)
 
 # Pattern for ${ENV_VAR} or ${ENV_VAR:default_value}
 _ENV_PATTERN = re.compile(r"\$\{(\w+)(?::([^}]*))?\}")
-
-
-def _last_quarter_end() -> str:
-    """Return the last calendar quarter-end date as YYYY-MM-DD."""
-    today = date.today()
-    # Quarter end months: 3 (Q1), 6 (Q2), 9 (Q3), 12 (Q4)
-    quarter_end_month = ((today.month - 1) // 3) * 3  # last completed quarter's end month
-    if quarter_end_month == 0:
-        # We're in Q1 — last quarter end was Dec 31 of previous year
-        return date(today.year - 1, 12, 31).strftime("%Y-%m-%d")
-    _, last_day = monthrange(today.year, quarter_end_month)
-    return date(today.year, quarter_end_month, last_day).strftime("%Y-%m-%d")
-
-
-# Built-in computed expressions available as ${expression_name} in any config value.
-# Resolution order: environment variable → built-in expression → original placeholder.
-_BUILTIN_EXPRESSIONS: dict[str, Any] = {
-    "last_quarter_end": _last_quarter_end,   # e.g. "2025-09-30"
-}
 
 
 class ConfigParser:
@@ -123,33 +102,25 @@ class ConfigParser:
         """Replace all ``${VAR}`` patterns in a string.
 
         Resolution order for each ``${name}`` token:
-        1. Built-in computed expression (e.g. ``last_quarter_end``) — evaluated fresh at parse time.
-           Runtime override is done via ``pipeline.run(parameters=...)``, not env vars.
-        2. Environment variable ``name`` — for infrastructure values like ``${SNOWFLAKE_ACCOUNT}``.
-        3. Inline default after ``:`` (e.g. ``${SNOWFLAKE_WH:ANALYTICS_WH}``).
-        4. Original placeholder left as-is — Pydantic will surface it if required.
+        1. Environment variable ``name`` — for infrastructure values like ``${SNOWFLAKE_ACCOUNT}``.
+        2. Inline default after ``:`` (e.g. ``${SNOWFLAKE_WH:ANALYTICS_WH}``).
+        3. Original placeholder left as-is — Pydantic will surface it if required.
         """
 
         def _replacer(match: re.Match) -> str:
             var_name = match.group(1)
             default = match.group(2)
 
-            # 1. Built-in computed expression — evaluated fresh at parse time.
-            #    Runtime override happens via pipeline.run(parameters=...), not here.
-            builtin = _BUILTIN_EXPRESSIONS.get(var_name)
-            if builtin is not None:
-                return builtin() if callable(builtin) else str(builtin)
-
-            # 2. Environment variable — for infrastructure values like ${SNOWFLAKE_ACCOUNT}
+            # 1. Environment variable
             env_val = os.environ.get(var_name)
             if env_val is not None:
                 return env_val
 
-            # 3. Inline default (e.g. ${SNOWFLAKE_WH:ANALYTICS_WH})
+            # 2. Inline default (e.g. ${SNOWFLAKE_WH:ANALYTICS_WH})
             if default is not None:
                 return default
 
-            # 4. Leave placeholder intact
+            # 3. Leave placeholder intact
             return match.group(0)
 
         return _ENV_PATTERN.sub(_replacer, value)
