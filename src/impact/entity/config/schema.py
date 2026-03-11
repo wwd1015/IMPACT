@@ -420,7 +420,7 @@ class EntityConfig(BaseModel):
             "Use @param_name syntax to reference runtime parameters."
         ),
     )
-    filters: list[str] | None = Field(
+    post_filters: list[str] | None = Field(
         None,
         description=(
             "Row-level filters applied AFTER all field processing (Pass 1 + Pass 2). "

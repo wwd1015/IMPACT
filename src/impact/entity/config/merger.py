@@ -10,7 +10,8 @@ Merge semantics by section:
 - ``parameters``: dict merge, custom wins on key conflict
 - ``sources``: merge by ``name``; same name = custom replaces; new names added
 - ``joins``: merge by ``(left, right)``; same pair = custom replaces; new pairs added
-- ``filters``: custom's filters are appended to primary's
+- ``pre_filters``: custom's pre_filters are appended to primary's
+- ``post_filters``: custom's post_filters are appended to primary's
 - ``fields``: merge by ``name``; same name = custom replaces entirely; new names added
 - ``validations``: custom's validations are appended to primary's
 
@@ -37,7 +38,7 @@ from impact.entity.config.schema import EntityConfig
 
 logger = get_logger(__name__)
 
-_KNOWN_SECTIONS = {"entity", "parameters", "sources", "joins", "pre_filters", "filters", "fields", "validations"}
+_KNOWN_SECTIONS = {"entity", "parameters", "sources", "joins", "pre_filters", "post_filters", "fields", "validations"}
 
 
 def merge_configs(
@@ -75,11 +76,12 @@ def merge_configs(
         raise ConfigError(f"Merged config validation failed: {exc}") from exc
 
     logger.info(
-        "Merged config parsed: entity=%s, sources=%d, joins=%d, filters=%d, fields=%d",
+        "Merged config parsed: entity=%s, sources=%d, joins=%d, pre_filters=%d, post_filters=%d, fields=%d",
         config.entity.name,
         len(config.sources),
         len(config.joins or []),
-        len(config.filters or []),
+        len(config.pre_filters or []),
+        len(config.post_filters or []),
         len(config.fields),
     )
     return config
@@ -138,11 +140,11 @@ def merge_raw_configs(
         section="pre_filters",
     )
 
-    # --- filters ---
-    merged["filters"] = _merge_append(
-        primary.get("filters", []),
-        custom.get("filters", []),
-        section="filters",
+    # --- post_filters ---
+    merged["post_filters"] = _merge_append(
+        primary.get("post_filters", []),
+        custom.get("post_filters", []),
+        section="post_filters",
     )
 
     # --- fields ---

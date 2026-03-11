@@ -78,11 +78,12 @@ class ConfigParser:
             raise ConfigError(f"Config validation failed: {exc}") from exc
 
         logger.info(
-            "Config parsed successfully: entity=%s, sources=%d, joins=%d, filters=%d, validations=%d, fields=%d",
+            "Config parsed successfully: entity=%s, sources=%d, joins=%d, pre_filters=%d, post_filters=%d, validations=%d, fields=%d",
             config.entity.name,
             len(config.sources),
             len(config.joins or []),
-            len(config.filters or []),
+            len(config.pre_filters or []),
+            len(config.post_filters or []),
             len(config.validations or []),
             len(config.fields),
         )

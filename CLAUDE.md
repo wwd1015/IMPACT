@@ -57,12 +57,13 @@ entity:        # [required] Name, description, version
 parameters:    # [optional] Global defaults; overridden by pipeline.run(parameters={...})
 sources:       # [required for top-level; omit for sub-entity configs]
 joins:         # [optional] How to combine sources (one_to_one / one_to_many)
-filters:       # [optional] Row-level filter expressions applied after field processing
-validations:   # [optional] Global validation rules (applied after field processing)
+pre_filters:   # [optional] Row-level filters applied BEFORE field processing (raw column names)
 fields:        # [required] Output schema — one entry per output column
+post_filters:  # [optional] Row-level filters applied AFTER field processing (processed field names)
+validations:   # [optional] Global validation rules (applied after field processing)
 ```
 
-`parameters`, `joins`, `filters`, and `validations` are optional. Every top-level pipeline must have `entity`, `sources`, and `fields`. Sub-entity configs (reused top-level configs) need only `entity` and `fields`.
+`parameters`, `joins`, `pre_filters`, `post_filters`, and `validations` are optional. Every top-level pipeline must have `entity`, `sources`, and `fields`. Sub-entity configs (reused top-level configs) need only `entity` and `fields`.
 
 ### Field Definition Reference
 
@@ -126,7 +127,8 @@ fields:
 | | source validations | Validate source fields (halt on error before derived runs) |
 | **Pass 2** — derived | expression / lambda | Evaluate using field names (no src_name prefix needed) |
 | | dtype cast + fill_na | Cast and fill derived columns |
-| Filters | row filters | `filters:` expressions applied with @param support |
+| Pre-filters | row filters | `pre_filters:` applied before field processing (raw column names) |
+| Post-filters | row filters | `post_filters:` applied after field processing (processed field names) |
 | Validations | derived + global validations | Validate derived fields and any global rules |
 | **Sub-entities** | entity_ref processing | Nested DataFrames validated/transformed → `list[SubEntity]` |
 | **Build** | drop temp fields | Fields with `temp: true` removed from entity class |

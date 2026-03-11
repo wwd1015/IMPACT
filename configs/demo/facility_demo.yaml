@@ -77,11 +77,6 @@ joins:
 pre_filters:
   - "commitment_amount > 0"
 
-# Post-filters — applied AFTER field processing (uses processed field names).
-# @active_product references the parameter value at runtime.
-filters:
-  - "product_category == @active_product"
-
 fields:
   # === PASS 1 — SOURCE FIELDS ===
 
@@ -180,3 +175,8 @@ fields:
       range: [0, null]
     validation_severity:
       range: error
+
+# Post-filters — applied AFTER field processing (uses processed field names).
+# @active_product references the parameter value at runtime.
+post_filters:
+  - "product_category == @active_product"

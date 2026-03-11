@@ -83,9 +83,6 @@ joins:
     relationship: one_to_many
     nested_as: facilities
 
-filters:
-  - "total_assets > 0"
-
 fields:
   # === PASS 1 — SOURCE FIELDS ===
 
@@ -195,3 +192,6 @@ fields:
   - name: leverage_flag
     derived: "lambda row: 'HIGH' if row['total_liabilities'] > row['total_assets'] else 'NORMAL'"
     dtype: str
+
+post_filters:
+  - "total_assets > 0"

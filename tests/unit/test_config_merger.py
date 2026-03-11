@@ -108,23 +108,42 @@ class TestMergeJoins:
         assert len(merged["joins"]) == 1
 
 
-class TestMergeFilters:
+class TestMergePreFilters:
     def test_custom_appended(self):
-        primary = {"filters": ["amount > 0"]}
-        custom = {"filters": ["region == 'US'"]}
+        primary = {"pre_filters": ["amount > 0"]}
+        custom = {"pre_filters": ["status == 'ACTIVE'"]}
         merged = merge_raw_configs(primary, custom)
-        assert merged["filters"] == ["amount > 0", "region == 'US'"]
+        assert merged["pre_filters"] == ["amount > 0", "status == 'ACTIVE'"]
+
+    def test_no_custom(self):
+        primary = {"pre_filters": ["amount > 0"]}
+        merged = merge_raw_configs(primary, {})
+        assert merged["pre_filters"] == ["amount > 0"]
+
+    def test_no_primary(self):
+        primary = {}
+        custom = {"pre_filters": ["x > 0"]}
+        merged = merge_raw_configs(primary, custom)
+        assert merged["pre_filters"] == ["x > 0"]
+
+
+class TestMergePostFilters:
+    def test_custom_appended(self):
+        primary = {"post_filters": ["amount > 0"]}
+        custom = {"post_filters": ["region == 'US'"]}
+        merged = merge_raw_configs(primary, custom)
+        assert merged["post_filters"] == ["amount > 0", "region == 'US'"]
 
     def test_no_custom_filters(self):
-        primary = {"filters": ["amount > 0"]}
+        primary = {"post_filters": ["amount > 0"]}
         merged = merge_raw_configs(primary, {})
-        assert merged["filters"] == ["amount > 0"]
+        assert merged["post_filters"] == ["amount > 0"]
 
     def test_no_primary_filters(self):
         primary = {}
-        custom = {"filters": ["x > 0"]}
+        custom = {"post_filters": ["x > 0"]}
         merged = merge_raw_configs(primary, custom)
-        assert merged["filters"] == ["x > 0"]
+        assert merged["post_filters"] == ["x > 0"]
 
 
 class TestMergeFields:
@@ -224,7 +243,8 @@ class TestMergeFullConfig:
         assert merged["parameters"] == {}
         assert merged["sources"] == []
         assert merged["joins"] == []
-        assert merged["filters"] == []
+        assert merged["pre_filters"] == []
+        assert merged["post_filters"] == []
         assert merged["fields"] == []
         assert merged["validations"] == []
 
@@ -233,18 +253,18 @@ class TestMergeFullConfig:
         primary = {"entity": {"name": "Facility"}}
         custom = {
             "parameters": {"region": "US"},
-            "filters": ["amount > 0"],
+            "post_filters": ["amount > 0"],
         }
         merged = merge_raw_configs(primary, custom)
         assert merged["parameters"]["region"] == "US"
-        assert merged["filters"] == ["amount > 0"]
+        assert merged["post_filters"] == ["amount > 0"]
 
     def test_duplicate_filters_appended(self):
         """Same filter in both should appear twice (append, not deduplicate)."""
-        primary = {"filters": ["amount > 0"]}
-        custom = {"filters": ["amount > 0"]}
+        primary = {"post_filters": ["amount > 0"]}
+        custom = {"post_filters": ["amount > 0"]}
         merged = merge_raw_configs(primary, custom)
-        assert merged["filters"] == ["amount > 0", "amount > 0"]
+        assert merged["post_filters"] == ["amount > 0", "amount > 0"]
 
 
 class TestMergeEdgeCases:

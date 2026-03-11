@@ -154,8 +154,8 @@ class EntityPipeline:
 
         # Pass 2: derived fields (eval → cast → fill_na), then post-filters
         result_df = self._apply_derived_fields(result_df)
-        if self.config.filters:
-            result_df = self._apply_filters(result_df, effective_params, self.config.filters)
+        if self.config.post_filters:
+            result_df = self._apply_filters(result_df, effective_params, self.config.post_filters)
 
         # 4. Validate derived fields + global validations
         logger.info("Stage 4/5: Running validations")

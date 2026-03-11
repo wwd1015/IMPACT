@@ -111,14 +111,6 @@ joins:
     relationship: one_to_many
     nested_as: facilities
 
-# ---------------------------------------------------------------------------
-# Row filters — applied after all field processing (Pass 1 + Pass 2).
-# Each entry is a pandas eval expression evaluated in order.
-# Use @param_name to reference a runtime parameter.
-# ---------------------------------------------------------------------------
-filters:
-  - "total_assets > 0"
-
 fields:
   # ===========================================================================
   # PASS 1 — SOURCE FIELDS
@@ -251,3 +243,9 @@ fields:
     derived: "lambda row: 'HIGH' if row['total_liabilities'] > row['total_assets'] else 'NORMAL'"
     dtype: str
     description: "HIGH when liabilities exceed assets, else NORMAL"
+
+# ---------------------------------------------------------------------------
+# Post-filters — applied after all field processing (Pass 1 + Pass 2).
+# ---------------------------------------------------------------------------
+post_filters:
+  - "total_assets > 0"

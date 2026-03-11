@@ -61,20 +61,6 @@ joins:
         right_col: product_type
     relationship: one_to_one
 
-# ---------------------------------------------------------------------------
-# Row filters — applied after all field processing (Pass 1 + Pass 2).
-# Each entry is a pandas eval expression evaluated in order.
-# Use @param_name to reference a runtime parameter (e.g. product_category == @active_product).
-# Static data-quality gates go here; source-level filtering belongs in the SQL query.
-# ---------------------------------------------------------------------------
-filters:
-  - "commitment_amount > 0"                # static data-quality gate
-  - "product_category == @active_product"   # parameterized — value injected at runtime from parameters.active_product
-  # Multiple conditions: use 'and' / 'or' with parentheses for grouping, same as Python.
-  # Each filter is a separate pandas eval expression — multiple entries are AND-ed together
-  # (each row must pass all filters). Use a single entry with 'or'/'and' for OR logic:
-  #   - "commitment_amount > 0 and (product_category == 'TERM_LOAN' or product_category == 'REVOLVER')"
-
 fields:
   # ---------------------------------------------------------------------------
   # Field definition reference
@@ -232,3 +218,12 @@ fields:
       range: [0, null]
     validation_severity:
       range: error
+
+# ---------------------------------------------------------------------------
+# Post-filters — applied after all field processing (Pass 1 + Pass 2).
+# Each entry is a pandas eval expression evaluated in order.
+# Use @param_name to reference a runtime parameter (e.g. product_category == @active_product).
+# ---------------------------------------------------------------------------
+post_filters:
+  - "commitment_amount > 0"                # static data-quality gate
+  - "product_category == @active_product"   # parameterized — value injected at runtime from parameters.active_product
