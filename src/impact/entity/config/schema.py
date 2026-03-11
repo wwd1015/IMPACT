@@ -45,7 +45,15 @@ class SnowflakeConnectionConfig(BaseModel):
 
 
 class SourceConfig(BaseModel):
-    """Configuration for a single data source."""
+    """Configuration for a single data source.
+
+    For Snowflake sources, ``connection`` can be either:
+    - An inline ``SnowflakeConnectionConfig`` dict (account, database, schema, warehouse, ...)
+    - A string referencing a named connection defined in the top-level ``connections`` section
+
+    String references are resolved by ``EntityConfig.resolve_connection_refs()``
+    during config validation.
+    """
 
     name: str = Field(..., description="Unique source identifier")
     type: Literal["snowflake", "sqlite", "parquet", "csv", "excel"] = Field(
@@ -53,8 +61,8 @@ class SourceConfig(BaseModel):
     )
     primary: bool = Field(False, description="Whether this is the primary source")
 
-    # Snowflake-specific
-    connection: SnowflakeConnectionConfig | None = None
+    # Snowflake-specific — inline config or string reference to connections section
+    connection: SnowflakeConnectionConfig | str | None = None
     query: str | None = None
 
     # File-based sources
@@ -67,7 +75,8 @@ class SourceConfig(BaseModel):
     @model_validator(mode="after")
     def validate_source_fields(self) -> SourceConfig:
         if self.type == "snowflake":
-            if not self.connection or not self.query:
+            # connection can be a string ref (resolved later by EntityConfig) or inline config
+            if self.connection is None or not self.query:
                 raise ValueError(
                     f"Source '{self.name}': snowflake type requires 'connection' and 'query'"
                 )
@@ -405,6 +414,15 @@ class EntityConfig(BaseModel):
             "are shared across sources."
         ),
     )
+    connections: dict[str, SnowflakeConnectionConfig] = Field(
+        default_factory=dict,
+        description=(
+            "Named connection configs. Define once, reference by name in sources. "
+            "Currently supports Snowflake connections. Example: "
+            "connections:\\n  lending_db:\\n    account: ...\\n"
+            "sources:\\n  - connection: lending_db  # reference by name"
+        ),
+    )
     sources: list[SourceConfig] = Field(
         default_factory=list,
         description="Data sources. Omit for sub-entity configs (nested data comes from parent).",
@@ -431,6 +449,21 @@ class EntityConfig(BaseModel):
     )
     validations: list[ValidationConfig] | None = None
     fields: list[FieldConfig]
+
+    @model_validator(mode="after")
+    def resolve_connection_refs(self) -> EntityConfig:
+        """Resolve string connection references to actual SnowflakeConnectionConfig objects."""
+        for source in self.sources:
+            if isinstance(source.connection, str):
+                ref_name = source.connection
+                if ref_name not in self.connections:
+                    available = ", ".join(sorted(self.connections)) or "(none)"
+                    raise ValueError(
+                        f"Source '{source.name}': connection '{ref_name}' not found "
+                        f"in connections section. Available: {available}"
+                    )
+                source.connection = self.connections[ref_name]
+        return self
 
     @model_validator(mode="after")
     def validate_single_primary(self) -> EntityConfig:

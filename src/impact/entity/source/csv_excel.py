@@ -22,7 +22,7 @@ class CsvConnector(DataSourceConnector):
     Supports all ``pandas.read_csv`` options via the ``options`` config block.
     """
 
-    def load(self, config: SourceConfig) -> pd.DataFrame:
+    def load(self, config: SourceConfig, **kwargs) -> pd.DataFrame:
         if not config.path:
             raise SourceError(f"Source '{config.name}': missing 'path' for csv type")
 
@@ -53,7 +53,7 @@ class ExcelConnector(DataSourceConnector):
     The ``openpyxl`` engine is used by default.
     """
 
-    def load(self, config: SourceConfig) -> pd.DataFrame:
+    def load(self, config: SourceConfig, **kwargs) -> pd.DataFrame:
         if not config.path:
             raise SourceError(f"Source '{config.name}': missing 'path' for excel type")
 

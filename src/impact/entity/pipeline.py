@@ -18,7 +18,7 @@ from impact.common.exceptions import ConfigError, SourceError, TransformError, V
 from impact.common.logging import get_logger
 from impact.common.utils import cast_and_fill, format_lambda_diagnostic, strip_source_prefixes
 from impact.entity.config.parser import ConfigParser
-from impact.entity.config.schema import EntityConfig
+from impact.entity.config.schema import EntityConfig, SnowflakeConnectionConfig
 from impact.entity.join.engine import JoinEngine
 from impact.entity.model.builder import EntityBuilder
 from impact.entity.sub_entity import process_sub_entity_fields
@@ -217,24 +217,48 @@ class EntityPipeline:
 
         Each source's parameters are resolved with priority:
         global config defaults → source-level overrides → runtime parameters.
+
+        Snowflake sources that share the same connection config reuse a single
+        connection object, avoiding redundant authentication round-trips.
         """
+        from impact.entity.source.snowflake import _connection_key, create_snowflake_connection
+
         frames: dict[str, pd.DataFrame] = {}
 
-        for source_cfg in self.config.sources:
-            # Priority: global defaults < source-level < runtime
-            merged = {**self.config.parameters, **source_cfg.parameters, **runtime_params}
-            effective_cfg = source_cfg.model_copy()
-            effective_cfg.parameters = merged
+        # Build shared Snowflake connections keyed by connection config identity
+        sf_connections: dict[tuple, Any] = {}
 
-            connector = ConnectorRegistry.get(effective_cfg.type)
-            df = connector.load(effective_cfg)
-            frames[effective_cfg.name] = df
-            logger.info(
-                "  Loaded source '%s': %d rows × %d columns",
-                effective_cfg.name,
-                len(df),
-                len(df.columns),
-            )
+        try:
+            for source_cfg in self.config.sources:
+                # Priority: global defaults < source-level < runtime
+                merged = {**self.config.parameters, **source_cfg.parameters, **runtime_params}
+                effective_cfg = source_cfg.model_copy()
+                effective_cfg.parameters = merged
+
+                connector = ConnectorRegistry.get(effective_cfg.type)
+
+                if effective_cfg.type == "snowflake" and isinstance(effective_cfg.connection, SnowflakeConnectionConfig):
+                    key = _connection_key(effective_cfg.connection)
+                    if key not in sf_connections:
+                        sf_connections[key] = create_snowflake_connection(effective_cfg.connection)
+                    df = connector.load(effective_cfg, connection=sf_connections[key])
+                else:
+                    df = connector.load(effective_cfg)
+
+                frames[effective_cfg.name] = df
+                logger.info(
+                    "  Loaded source '%s': %d rows × %d columns",
+                    effective_cfg.name,
+                    len(df),
+                    len(df.columns),
+                )
+        finally:
+            # Close all shared Snowflake connections
+            for conn in sf_connections.values():
+                try:
+                    conn.close()
+                except Exception:
+                    pass
 
         return frames
 

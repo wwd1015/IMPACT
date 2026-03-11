@@ -41,7 +41,7 @@ class SqliteConnector(DataSourceConnector):
           source_table: "facility_main"
     """
 
-    def load(self, config: SourceConfig) -> pd.DataFrame:
+    def load(self, config: SourceConfig, **kwargs) -> pd.DataFrame:
         if not config.path:
             raise SourceError(f"Source '{config.name}': missing 'path' for sqlite type")
         if not config.query:

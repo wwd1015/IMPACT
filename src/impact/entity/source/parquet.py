@@ -26,7 +26,7 @@ class ParquetConnector(DataSourceConnector):
     - Path parameter interpolation (e.g. ``data/{snapshot_date}/*.parquet``)
     """
 
-    def load(self, config: SourceConfig) -> pd.DataFrame:
+    def load(self, config: SourceConfig, **kwargs) -> pd.DataFrame:
         if not config.path:
             raise SourceError(f"Source '{config.name}': missing 'path' for parquet type")
 

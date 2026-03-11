@@ -23,22 +23,31 @@ parameters:
   snapshot_date: "2025-12-31"
 
 # ---------------------------------------------------------------------------
+# Connections — define once, reference by name in sources.
+# Avoids repeating credentials when multiple sources use the same Snowflake
+# account. The pipeline reuses a single connection object at runtime.
+# ---------------------------------------------------------------------------
+connections:
+  lending_db:
+    account: "${SNOWFLAKE_ACCOUNT}"
+    database: CREDIT_DB
+    schema: LENDING
+    warehouse: "${SNOWFLAKE_WH:ANALYTICS_WH}"
+
+# ---------------------------------------------------------------------------
 # Sources
 #
 # The obligor entity is derived from the same facility_master table.
 # We load it twice: once for distinct obligor-level attributes (primary),
 # and once for the full facility rows that will be nested under each obligor.
 # Collateral and rating overrides are loaded for pre-joining into facility rows.
+# Both Snowflake sources reference the same connection: lending_db.
 # ---------------------------------------------------------------------------
 sources:
   - name: obligor_main
     type: snowflake
     primary: true
-    connection:
-      account: "${SNOWFLAKE_ACCOUNT}"
-      database: CREDIT_DB
-      schema: LENDING
-      warehouse: "${SNOWFLAKE_WH:ANALYTICS_WH}"
+    connection: lending_db
     query: |
       SELECT DISTINCT obligor_id, legal_name, industry, country,
              revenue, total_assets, total_liabilities, founded_date
@@ -47,11 +56,7 @@ sources:
 
   - name: facility_detail
     type: snowflake
-    connection:
-      account: "${SNOWFLAKE_ACCOUNT}"
-      database: CREDIT_DB
-      schema: LENDING
-      warehouse: "${SNOWFLAKE_WH:ANALYTICS_WH}"
+    connection: lending_db
     query: |
       SELECT facility_id, obligor_id, product_type,
              commitment_amount, outstanding_balance,

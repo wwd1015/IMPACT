@@ -17,11 +17,13 @@ class DataSourceConnector(ABC):
     """
 
     @abstractmethod
-    def load(self, config: SourceConfig) -> pd.DataFrame:
+    def load(self, config: SourceConfig, **kwargs) -> pd.DataFrame:
         """Load data from the configured source.
 
         Args:
             config: Source configuration parsed from YAML.
+            **kwargs: Optional connector-specific arguments (e.g. ``connection``
+                for Snowflake to reuse a shared connection object).
 
         Returns:
             DataFrame containing the loaded data.

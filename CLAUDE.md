@@ -55,6 +55,7 @@ src/impact/
 ```yaml
 entity:        # [required] Name, description, version
 parameters:    # [optional] Global defaults; overridden by pipeline.run(parameters={...})
+connections:   # [optional] Named connection configs (define once, reference by name in sources)
 sources:       # [required for top-level; omit for sub-entity configs]
 joins:         # [optional] How to combine sources (one_to_one / one_to_many)
 pre_filters:   # [optional] Row-level filters applied BEFORE field processing (raw column names)
@@ -63,7 +64,45 @@ post_filters:  # [optional] Row-level filters applied AFTER field processing (pr
 validations:   # [optional] Global validation rules (applied after field processing)
 ```
 
-`parameters`, `joins`, `pre_filters`, `post_filters`, and `validations` are optional. Every top-level pipeline must have `entity`, `sources`, and `fields`. Sub-entity configs (reused top-level configs) need only `entity` and `fields`.
+`parameters`, `joins`, `connections`, `pre_filters`, `post_filters`, and `validations` are optional. Every top-level pipeline must have `entity`, `sources`, and `fields`. Sub-entity configs (reused top-level configs) need only `entity` and `fields`.
+
+### Shared Connections
+
+Define a connection once in the `connections` section, reference by name in sources. Multiple sources sharing the same connection reuse a single connection object at runtime.
+
+```yaml
+connections:
+  lending_db:
+    account: "${SNOWFLAKE_ACCOUNT}"
+    database: CREDIT_DB
+    schema: LENDING
+    warehouse: "${SNOWFLAKE_WH:ANALYTICS_WH}"
+
+sources:
+  - name: obligor_main
+    type: snowflake
+    connection: lending_db        # reference by name — no need to repeat credentials
+    query: |
+      SELECT ...
+
+  - name: facility_detail
+    type: snowflake
+    connection: lending_db        # same connection, reused at runtime
+    query: |
+      SELECT ...
+```
+
+Inline connection configs still work for single-source configs:
+```yaml
+sources:
+  - name: facility_main
+    type: snowflake
+    connection:                   # inline — still supported
+      account: "${SNOWFLAKE_ACCOUNT}"
+      database: CREDIT_DB
+      schema: LENDING
+      warehouse: "${SNOWFLAKE_WH:ANALYTICS_WH}"
+```
 
 ### Field Definition Reference
 

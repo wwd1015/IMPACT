@@ -13,15 +13,19 @@ parameters:
   snapshot_date: "2025-12-31"            # override at runtime: pipeline.run(parameters={"snapshot_date": "..."})
   active_product: "TERM_LOAN"    # override per run: pipeline.run(parameters={"active_product": "REVOLVER"})
 
+# Define Snowflake connection once — reference by name in sources.
+connections:
+  lending_db:
+    account: "${SNOWFLAKE_ACCOUNT}"          # resolved from env var: export SNOWFLAKE_ACCOUNT=myorg-myaccount
+    database: CREDIT_DB
+    schema: LENDING
+    warehouse: "${SNOWFLAKE_WH:ANALYTICS_WH}"  # resolved from env var; falls back to ANALYTICS_WH if unset
+
 sources:
   - name: facility_main
     type: snowflake
     primary: true
-    connection:
-      account: "${SNOWFLAKE_ACCOUNT}"          # resolved from env var: export SNOWFLAKE_ACCOUNT=myorg-myaccount
-      database: CREDIT_DB
-      schema: LENDING
-      warehouse: "${SNOWFLAKE_WH:ANALYTICS_WH}"  # resolved from env var; falls back to ANALYTICS_WH if unset
+    connection: lending_db
     query: |
       SELECT facility_id, obligor_id, product_type,
              commitment_amount, outstanding_balance,
