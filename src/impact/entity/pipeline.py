@@ -135,6 +135,11 @@ class EntityPipeline:
         logger.info("Stage 2/5: Executing joins")
         result_df = self._execute_joins(frames)
 
+        # 2b. Pre-filters — reduce dataset before field processing
+        if self.config.pre_filters:
+            logger.info("Applying pre-filters (before field processing)")
+            result_df = self._apply_filters(result_df, effective_params, self.config.pre_filters)
+
         # 3. Field transforms — two ordered passes
         logger.info("Stage 3/5: Applying transformations")
 
@@ -147,9 +152,10 @@ class EntityPipeline:
             logger.error("Source field validation failed with %d errors", report.error_count)
             raise ValidationError(report=report, message=report.format_detail())
 
-        # Pass 2: derived fields (eval → cast → fill_na), then row filters
+        # Pass 2: derived fields (eval → cast → fill_na), then post-filters
         result_df = self._apply_derived_fields(result_df)
-        result_df = self._apply_filters(result_df, effective_params)
+        if self.config.filters:
+            result_df = self._apply_filters(result_df, effective_params, self.config.filters)
 
         # 4. Validate derived fields + global validations
         logger.info("Stage 4/5: Running validations")
@@ -259,14 +265,17 @@ class EntityPipeline:
 
         return resolved[primary_name]
 
-    def _apply_filters(self, df: pd.DataFrame, parameters: dict[str, Any]) -> pd.DataFrame:
-        """Apply row-level filter conditions after all field processing.
+    def _apply_filters(
+        self, df: pd.DataFrame, parameters: dict[str, Any],
+        filters: list[str],
+    ) -> pd.DataFrame:
+        """Apply row-level filter expressions.
 
         Filters are pandas eval expressions evaluated in order. Use ``@param_name``
         syntax to reference values from ``parameters`` (e.g. ``status == @active_status``).
         """
         result = df
-        for condition in self.config.filters or []:
+        for condition in filters:
             before = len(result)
             try:
                 mask = result.eval(condition, local_dict=parameters)

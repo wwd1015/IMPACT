@@ -410,13 +410,23 @@ class EntityConfig(BaseModel):
         description="Data sources. Omit for sub-entity configs (nested data comes from parent).",
     )
     joins: list[JoinConfig] | None = None
+    pre_filters: list[str] | None = Field(
+        None,
+        description=(
+            "Row-level filters applied BEFORE field processing (right after joins). "
+            "Use raw source column names (before any renaming). "
+            "Reduces the dataset early for better performance on large data. "
+            "Each entry is a pandas eval expression. "
+            "Use @param_name syntax to reference runtime parameters."
+        ),
+    )
     filters: list[str] | None = Field(
         None,
         description=(
-            "Row-level filter conditions applied after all field processing. "
-            "Each entry is a pandas eval expression (e.g. 'commitment_amount > 0'). "
-            "Use @param_name syntax to reference runtime parameters "
-            "(e.g. 'status == @active_status')."
+            "Row-level filters applied AFTER all field processing (Pass 1 + Pass 2). "
+            "Use processed field names (after renaming). "
+            "Each entry is a pandas eval expression. "
+            "Use @param_name syntax to reference runtime parameters."
         ),
     )
     validations: list[ValidationConfig] | None = None

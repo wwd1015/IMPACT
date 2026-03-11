@@ -72,9 +72,14 @@ joins:
         right_col: product_type
     relationship: one_to_one
 
-# @active_product references the parameter value at runtime
-filters:
+# Pre-filters — applied BEFORE field processing (uses raw source column names).
+# Reduces the dataset early for better performance on large data.
+pre_filters:
   - "commitment_amount > 0"
+
+# Post-filters — applied AFTER field processing (uses processed field names).
+# @active_product references the parameter value at runtime.
+filters:
   - "product_category == @active_product"
 
 fields:
