@@ -23,7 +23,7 @@ All pipeline logic is declared in a single YAML config file. Python code is the 
 src/impact/
 ├── entity/
 │   ├── config/          # Pydantic v2 schema, YAML parser, config merger (primary + custom override)
-│   ├── source/          # Data connectors: Snowflake, Parquet, CSV, Excel
+│   ├── source/          # Data connectors: Snowflake, SQLite, Parquet, CSV, Excel
 │   ├── join/            # Join engine with nested DataFrame support (1-to-many)
 │   ├── transform/       # 7 built-in types: cast, rename, derive, fill_na, drop, filter, custom
 │   ├── validate/        # 5 built-in types: not_null, unique, range, expression, custom
@@ -48,7 +48,7 @@ src/impact/
 4. **Fail-fast** — Config is fully validated at parse time (Pydantic v2) before any data is touched.
 5. **Severity levels** — Validations use `error` (halt pipeline) or `warning` (log and continue).
 6. **Row-level diagnostics** — On failure, the pipeline identifies the exact rows and values that caused the error. Cast failures show un-castable values, lambda errors show the failing row's data, and sub-entity errors include parent row context (primary key values). All diagnostic work is error-path-only (zero overhead on success).
-7. **Config merge** — IMPACT provides standardized primary configs. Users create sparse custom configs that are merged before parsing. Fields/sources/joins merge by key (custom replaces same-key); filters/validations are appended. Use `merge_configs(primary=..., custom=...)` from `impact.entity.config.merger`.
+7. **Config merge** — IMPACT provides standardized primary configs. Users create sparse custom configs that are merged before parsing. Fields/sources/joins merge by key (custom replaces same-key); connections merge by name (custom wins); pre_filters/post_filters/validations are appended. Use `merge_configs(primary=..., custom=...)` from `impact.entity.config.merger`.
 
 ### YAML Config Structure
 
@@ -121,12 +121,13 @@ fields:
                                  #              different col name → rename.
     source: "<expression>"       # expression — evaluated via df.eval(); src_name.col notation
                                  #              works and is stripped before evaluation.
-                                 #              e.g. "src.col_a - src.col_b"
+                                 #              e.g. "col_a - col_b" (primary source prefix optional)
     #
     # derived — processed in Pass 2, after ALL source fields are renamed, cast,
     #           filled, and validated. Use field names only — no src_name prefix.
     derived: "<expression>"      #   pandas expression: "col_a / col_b"
                                  #   row-wise lambda:   "lambda row: row['a'] * 2"
+                                 #   Parameters: use @param in eval, variable name in lambda
 
     # --- Type casting (required) ---
     dtype: <type>                # cast the column to this type after source/derived.
@@ -160,14 +161,14 @@ fields:
 
 | Pass | Step | What happens |
 |---|---|---|
+| **Pre-filters** | row filters | `pre_filters:` applied after joins, before field processing (raw column names) |
 | **Pass 1** — source | rename / expression | Batch rename, then evaluate source expressions |
 | | dtype cast | Cast to declared type |
 | | fill_na | Fill NAs |
 | | source validations | Validate source fields (halt on error before derived runs) |
 | **Pass 2** — derived | expression / lambda | Evaluate using field names (no src_name prefix needed) |
 | | dtype cast + fill_na | Cast and fill derived columns |
-| Pre-filters | row filters | `pre_filters:` applied before field processing (raw column names) |
-| Post-filters | row filters | `post_filters:` applied after field processing (processed field names) |
+| **Post-filters** | row filters | `post_filters:` applied after field processing (processed field names) |
 | Validations | derived + global validations | Validate derived fields and any global rules |
 | **Sub-entities** | entity_ref processing | Nested DataFrames validated/transformed → `list[SubEntity]` |
 | **Build** | drop temp fields | Fields with `temp: true` removed from entity class |
@@ -204,6 +205,7 @@ class MyValidator(Validator):
 | Config validation | Pydantic v2 |
 | YAML parsing | PyYAML (safe_load) |
 | Snowflake | snowflake-connector-python (optional) |
+| SQLite | sqlite3 (stdlib) |
 | Parquet | pyarrow |
 | Excel | openpyxl |
 | Testing | pytest |
@@ -263,6 +265,7 @@ Built-in connectors, transforms, and validators are registered via `@Registry.re
 
 ```python
 import impact.entity.source.csv_excel   # triggers @ConnectorRegistry.register(...)
+import impact.entity.source.sqlite      # triggers @ConnectorRegistry.register(...)
 import impact.entity.transform.builtin  # triggers @TransformRegistry.register(...)
 import impact.entity.validate.builtin   # triggers @ValidatorRegistry.register(...)
 ```
@@ -295,7 +298,7 @@ Joins execute in config order. Each result updates `resolved[join_cfg.left]`, so
 - `nested` with `entity_ref` maps to `list` (of sub-entity instances); without `entity_ref` maps to `pd.DataFrame`
 - Primary key fields have no default in the generated dataclass; all others default to `None`
 - The generated class gets `__entity_fields__`, `__primary_key__`, and `__entity_name__` attributes
-- Sub-entity configs are resolved by convention: `{snake_case(entity_ref)}.yaml` in the parent config's directory
+- Sub-entity configs are resolved by convention: `{snake_case(entity_ref)}.yaml` or `{snake_case(entity_ref)}_*.yaml` (glob matching) in the parent config's directory
 
 ### Custom Functions (Transform / Validator)
 

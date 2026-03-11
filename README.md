@@ -17,7 +17,8 @@ A YAML-config-driven platform for financial lending credit modeling, providing s
     - [parameters](#parameters)
     - [sources](#sources)
     - [joins](#joins)
-    - [filters](#filters)
+    - [connections](#connections)
+    - [pre_filters / post_filters](#pre_filters--post_filters)
     - [fields](#fields)
     - [validations](#validations)
   - [Config Merge — Custom Overrides](#config-merge--custom-overrides)
@@ -139,6 +140,23 @@ connection:
 
 ---
 
+#### `connections`
+
+Named connection configs — define once, reference by name in sources. Currently supports Snowflake. Multiple sources sharing the same connection reuse a single connection object at runtime.
+
+```yaml
+connections:
+  lending_db:
+    account: "${SNOWFLAKE_ACCOUNT}"
+    database: CREDIT_DB
+    schema: LENDING
+    warehouse: "${SNOWFLAKE_WH:ANALYTICS_WH}"
+```
+
+Sources reference by name: `connection: lending_db`
+
+---
+
 #### `sources`
 
 One or more data sources. Exactly one must be marked `primary: true` — it is the anchor row count for all joins.
@@ -164,6 +182,23 @@ sources:
       FROM facility_master
       WHERE snapshot_date = '{snapshot_date}'
 ```
+
+**SQLite:**
+
+```yaml
+  - name: facility_main
+    type: sqlite
+    primary: true
+    path: "data/sample/lending.db"
+    query: |
+      SELECT facility_id, commitment_amount
+      FROM {source_table}
+      WHERE snapshot_date = '{snapshot_date}'
+```
+
+Query parameters use `{param}` syntax — interpolated from the merged parameters before execution.
+
+> **Tip:** For Snowflake sources, you can define credentials once in the [`connections`](#connections) section and reference by name — see below.
 
 **Parquet:**
 
@@ -278,27 +313,37 @@ After these joins, each obligor row's `facilities` nested DataFrame contains fac
 
 ---
 
-#### `filters`
+#### `pre_filters / post_filters`
 
-Row-level conditions applied **after all field processing** (Pass 1 + Pass 2). Each entry is a pandas eval expression. A row must pass **all** entries to be retained — multiple entries are AND-ed together implicitly.
+Row-level filter conditions split into two stages. Each entry is a pandas eval expression. A row must pass **all** entries to be retained — multiple entries are AND-ed together implicitly.
+
+**`pre_filters`** — applied **before field processing** (right after joins). Use raw source column names. Reduces the dataset early for better performance on large data.
 
 ```yaml
-filters:
-  - "commitment_amount > 0"        # static data-quality gate
+pre_filters:
+  - "commitment_amount > 0"
+```
+
+**`post_filters`** — applied **after all field processing** (Pass 1 + Pass 2). Use processed field names.
+
+```yaml
+post_filters:
   - "product_category == @active_product"  # @name references a value from parameters
 ```
+
+Both support `@param_name` syntax to reference runtime parameters. Parameters are also accessible in derived expressions via `@param` (eval) or as variables in lambdas.
 
 **AND / OR logic within a single filter** — use Python boolean syntax with parentheses for grouping. When conditions are logically related, combine them into one entry:
 
 ```yaml
-filters:
+post_filters:
   - "commitment_amount > 0 and (product_category == 'TERM_LOAN' or product_category == 'REVOLVER')"
 ```
 
 Use multiple entries when conditions are independent so failures are easier to identify in logs:
 
 ```yaml
-filters:
+post_filters:
   - "commitment_amount > 0"
   - "interest_rate >= 0 and interest_rate <= 1"
 ```
@@ -313,9 +358,11 @@ Defines the output entity class. Each field declares its data origin, type, fill
 
 | Pass | Origin | Steps |
 |---|---|---|
+| Pre-filters | — | `pre_filters:` applied after joins, before field processing (raw column names) |
 | Pass 1 | `source` | rename / expression eval → cast → fill_na → validation |
 | Pass 2 | `derived` | expression eval → cast → fill_na → validation |
-| Post | — | filters applied, `temp` fields dropped, entity class built |
+| Post-filters | — | `post_filters:` applied after field processing (processed field names) |
+| Post | — | `temp` fields dropped, entity class built |
 
 **Every field requires exactly one of `source` or `derived`.**
 
@@ -384,7 +431,7 @@ fields:
 
 # Source expression — evaluated in Pass 1; src_name. prefixes are stripped automatically
 - name: available_capacity
-  source: "facility_main.commitment_amount - facility_main.outstanding_balance"
+  source: "commitment_amount - outstanding_balance"
   dtype: float64
   temp: true                  # used by derived fields; excluded from the entity class
 ```
@@ -501,9 +548,11 @@ result = EntityPipeline(config=config).run()
 | `parameters` | Dict merge, custom wins on conflict | Override `active_product` while keeping `snapshot_date` |
 | `sources` | Merge by `name`; same name = replace entirely; new = added | Swap a Snowflake source for CSV in dev |
 | `joins` | Merge by `(left, right)` pair; same pair = replace; new = added | Change join type or add new joins |
-| `filters` | Custom filters appended to primary's | Add stricter data-quality gates |
+| `pre_filters` | Custom pre_filters appended to primary's | Add early data reduction gates |
+| `post_filters` | Custom post_filters appended to primary's | Add stricter post-processing gates |
 | `fields` | Merge by `name`; same name = replace entirely; new = added | Override a field's dtype, source, or validation |
 | `validations` | Custom validations appended to primary's | Add extra validation rules |
+| `connections` | Dict merge, custom wins on conflict | Override or add named connections |
 
 **Example custom config** — only includes what's different:
 
@@ -537,8 +586,8 @@ fields:
     dtype: str
     fill_na: "UNKNOWN"
 
-filters:
-  - "region != 'EXCLUDED'"             # appended to primary's filters
+post_filters:
+  - "region != 'EXCLUDED'"             # appended to primary's post_filters
 ```
 
 **Merge logging** — the merger logs every adjustment so users can verify the effect:
@@ -548,7 +597,7 @@ INFO | [merge] parameters: overridden: ['active_product']
 INFO | [merge] sources: overridden: ['collateral']
 INFO | [merge] fields: overridden: ['commitment_amount']
 INFO | [merge] fields: added: ['region']
-INFO | [merge] filters: appended 1 custom entries
+INFO | [merge] post_filters: appended 1 custom entries
 ```
 
 **Key design principles:**
@@ -577,11 +626,13 @@ src/impact/
 └── entity/
     ├── config/
     │   ├── schema.py        # Pydantic v2 models — single source of truth for all config shapes
-    │   └── parser.py        # YAML loader, ${VAR} / built-in expression interpolation
+    │   ├── parser.py        # YAML loader, ${VAR} / built-in expression interpolation
+    │   └── merger.py        # Config merger — primary + custom override merge logic
     ├── source/
     │   ├── base.py          # DataSourceConnector ABC
     │   ├── registry.py      # ConnectorRegistry — @register decorator + singleton cache
-    │   ├── snowflake.py     # SnowflakeConnector
+    │   ├── snowflake.py     # SnowflakeConnector (shared connections, {param} interpolation)
+    │   ├── sqlite.py        # SqliteConnector ({param} interpolation for tables + values)
     │   ├── parquet.py       # ParquetConnector (glob + path interpolation)
     │   └── csv_excel.py     # CsvConnector, ExcelConnector
     ├── join/
@@ -627,7 +678,11 @@ EntityPipeline.run(parameters)
 ├── Stage 2 — Execute joins (in config order)
 │       Each join updates resolved[left] with the result
 │       Supports pre-joins between non-primary sources
+│       Shared Snowflake connections reused across sources with same connection name
 │       JoinEngine.execute() — flat (one_to_one) or nested (one_to_many)
+│
+├── Stage 2b — Pre-filters (raw column names, before field processing)
+│       Per filter: df.eval(condition, local_dict=effective_params)
 │
 ├── Stage 3 — Field processing
 │   │
@@ -637,10 +692,10 @@ EntityPipeline.run(parameters)
 │   │       Source field validations → halt on any error-severity failure
 │   │
 │   └── Pass 2 — derived fields
-│               Per field: df.eval() or lambda → cast → fill_na
+│               Per field: df.eval(expr, local_dict=params) or lambda (params in namespace)
 │
-├── Stage 3b — Row filters
-│       Per filter string: df.eval(condition, local_dict=effective_params)
+├── Stage 3b — Post-filters (processed field names)
+│       Per filter: df.eval(condition, local_dict=effective_params)
 │
 ├── Stage 4 — Validations
 │       Derived field inline validations
@@ -672,12 +727,12 @@ When a field has `dtype: nested` and `entity_ref` set, the pipeline automaticall
 **How it works:**
 
 1. The parent pipeline's one-to-many join produces a nested `pd.DataFrame` in each cell of the nested column (e.g. `collateral_items`).
-2. After parent validations pass, the pipeline resolves the sub-entity config by convention — it looks for `{snake_case(entity_ref)}.yaml` or `{snake_case(entity_ref)}_example.yaml` in the same directory as the parent config.
-3. Each cell's DataFrame is processed through `SubEntityProcessor`, which applies the same two-pass field processing as the main pipeline (rename → cast → fill_na → validate → derived → build), but without sources, joins, or filters.
+2. After parent validations pass, the pipeline resolves the sub-entity config by convention — it looks for `{snake_case(entity_ref)}.yaml` or `{snake_case(entity_ref)}_*.yaml` in the same directory as the parent config.
+3. Each cell's DataFrame is processed through `SubEntityProcessor`, which applies the same two-pass field processing as the main pipeline (rename → cast → fill_na → validate → derived → build), but without sources, joins, or filters (pre/post).
 4. The nested DataFrame cells are replaced with `list[SubEntity]` — each element is a dataclass instance of the sub-entity type.
 5. Sub-entity validation results are merged into the parent's `ValidationReport`.
 
-**Sub-entity config format** — same as a top-level config, but with no `sources`, `joins`, or `filters`:
+**Sub-entity config format** — same as a top-level config, but with no `sources`, `joins`, or `filters` (pre/post):
 
 ```yaml
 # configs/collateral_example.yaml
@@ -721,11 +776,15 @@ result.sub_entity_classes          # → {"collateral_items": <class 'Collateral
 
 **Config file naming convention:**
 
-For `entity_ref: Collateral`, the pipeline searches in the parent config's directory for `{snake_case(entity_ref)}.yaml` or `{snake_case(entity_ref)}_example.yaml`. For multi-word names like `FinancialStatement`, it also tries the plain lowercase variants:
+For `entity_ref: Collateral`, the pipeline searches in the parent config's directory:
+1. `collateral.yaml` (exact match)
+2. `collateral_*.yaml` (glob match, e.g. `collateral_demo.yaml`)
+
+For multi-word names like `FinancialStatement`, it also tries the plain lowercase variants:
 1. `financial_statement.yaml`
-2. `financial_statement_example.yaml`
+2. `financial_statement_*.yaml`
 3. `financialstatement.yaml`
-4. `financialstatement_example.yaml`
+4. `financialstatement_*.yaml`
 
 **Recursive sub-entities** — sub-entity configs can themselves contain `entity_ref` fields, enabling multi-level nesting. For example, the obligor pipeline produces:
 
@@ -761,7 +820,7 @@ import pandas as pd
 
 @ConnectorRegistry.register("my_source")
 class MyConnector(DataSourceConnector):
-    def load(self, config: SourceConfig) -> pd.DataFrame:
+    def load(self, config: SourceConfig, **kwargs) -> pd.DataFrame:
         # Available: config.path, config.parameters, config.options,
         #            config.connection (Snowflake only), config.query (Snowflake only)
         ...

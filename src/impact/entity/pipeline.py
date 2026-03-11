@@ -144,7 +144,7 @@ class EntityPipeline:
         logger.info("Stage 3/5: Applying transformations")
 
         # Pass 1: source fields (rename/expr → cast → fill_na)
-        result_df = self._apply_source_fields(result_df)
+        result_df = self._apply_source_fields(result_df, effective_params)
 
         # Validate source fields before derived fields run
         report = self._run_field_validations(result_df, pass_filter="source")
@@ -153,7 +153,7 @@ class EntityPipeline:
             raise ValidationError(report=report, message=report.format_detail())
 
         # Pass 2: derived fields (eval → cast → fill_na), then post-filters
-        result_df = self._apply_derived_fields(result_df)
+        result_df = self._apply_derived_fields(result_df, effective_params)
         if self.config.post_filters:
             result_df = self._apply_filters(result_df, effective_params, self.config.post_filters)
 
@@ -309,7 +309,9 @@ class EntityPipeline:
             logger.info("  Filter '%s': %d → %d rows", condition, before, len(result))
         return result
 
-    def _apply_source_fields(self, df: pd.DataFrame) -> pd.DataFrame:
+    def _apply_source_fields(
+        self, df: pd.DataFrame, parameters: dict[str, Any] | None = None,
+    ) -> pd.DataFrame:
         """Pass 1 — process all source fields: rename/expr → cast → fill_na.
 
         ``source`` accepts two forms (source-name prefixes are stripped automatically):
@@ -318,7 +320,10 @@ class EntityPipeline:
 
         All renames are batched into a single ``rename()`` call before any
         expression sources or per-field cast/fill_na are applied.
+
+        Parameters are available in expressions via ``@param_name`` syntax.
         """
+        params = parameters or {}
         result = df.copy()
         source_prefixes = {s.name for s in self.config.sources}
 
@@ -354,7 +359,7 @@ class EntityPipeline:
             if not stripped.isidentifier():
                 # Source is an expression — evaluate it
                 try:
-                    result[field.name] = result.eval(stripped)
+                    result[field.name] = result.eval(stripped, local_dict=params)
                 except Exception as exc:
                     raise TransformError(
                         f"Field '{field.name}': failed to evaluate source expression "
@@ -366,13 +371,21 @@ class EntityPipeline:
 
         return result
 
-    def _apply_derived_fields(self, df: pd.DataFrame) -> pd.DataFrame:
+    def _apply_derived_fields(
+        self, df: pd.DataFrame, parameters: dict[str, Any] | None = None,
+    ) -> pd.DataFrame:
         """Pass 2 — compute derived fields after all source fields are processed.
 
         ``derived`` runs after source fields are fully renamed, cast, filled, and
         validated. Use field names only — no ``src_name.`` prefix needed or expected.
         Supports pandas expressions and row-wise lambdas.
+
+        Parameters are available via:
+        - ``@param_name`` in pandas eval expressions
+        - Direct variable name in lambdas (e.g. ``lambda row: row['a'] * threshold``)
         """
+        params = parameters or {}
+        lambda_ns = {"__builtins__": __builtins__, **params}
         result = df
         for field in self.config.fields:
             if field.derived is None:
@@ -380,10 +393,10 @@ class EntityPipeline:
             expr = field.derived.strip()
             try:
                 if expr.startswith("lambda"):
-                    fn = eval(expr)  # noqa: S307 — user-supplied expression
+                    fn = eval(expr, lambda_ns)  # noqa: S307
                     result[field.name] = result.apply(fn, axis=1)
                 else:
-                    result[field.name] = result.eval(expr)
+                    result[field.name] = result.eval(expr, local_dict=params)
             except Exception as exc:
                 diag, samples = "", []
                 if expr.startswith("lambda"):

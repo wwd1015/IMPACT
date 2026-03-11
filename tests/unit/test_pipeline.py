@@ -130,3 +130,109 @@ class TestPipelineWithoutOptionalSteps:
         assert len(result.entities) == 1
         assert result.entities[0].id == "X"
         assert result.entities[0].name == "Test"
+
+
+class TestParametersInExpressions:
+    """Test that @param / param variables work in derived expressions and lambdas."""
+
+    def _make_config(self, tmp_dir, fields, parameters=None, **extra):
+        """Helper to create a simple config with parameters.
+
+        Args:
+            extra: Additional top-level config keys (e.g. pre_filters, post_filters).
+        """
+        import pandas as pd
+
+        csv_path = tmp_dir / "data.csv"
+        pd.DataFrame({
+            "id": ["A", "B", "C"],
+            "amount": [100.0, 200.0, 300.0],
+            "rate": [0.05, 0.10, 0.15],
+        }).to_csv(csv_path, index=False)
+
+        config_dict = {
+            "entity": {"name": "TestEntity"},
+            "parameters": parameters or {},
+            "sources": [{"name": "main", "type": "csv", "primary": True, "path": str(csv_path)}],
+            "fields": [
+                {"name": "id", "source": "id", "dtype": "str", "primary_key": True},
+                {"name": "amount", "source": "amount", "dtype": "float64"},
+                {"name": "rate", "source": "rate", "dtype": "float64"},
+            ] + fields,
+            **extra,
+        }
+        return EntityConfig.model_validate(config_dict)
+
+    def test_param_in_derived_eval_expression(self, tmp_dir):
+        """@param works in pandas eval derived expressions."""
+        config = self._make_config(tmp_dir, [
+            {"name": "scaled", "derived": "amount * @scale_factor", "dtype": "float64"},
+        ], parameters={"scale_factor": 2.0})
+
+        result = EntityPipeline(config=config).run()
+        assert list(result.dataframe["scaled"]) == [200.0, 400.0, 600.0]
+
+    def test_param_in_derived_lambda(self, tmp_dir):
+        """Parameters are accessible as variables in lambda expressions."""
+        config = self._make_config(tmp_dir, [
+            {
+                "name": "adjusted",
+                "derived": "lambda row: row['amount'] * multiplier",
+                "dtype": "float64",
+            },
+        ], parameters={"multiplier": 3.0})
+
+        result = EntityPipeline(config=config).run()
+        assert list(result.dataframe["adjusted"]) == [300.0, 600.0, 900.0]
+
+    def test_param_in_source_expression(self, tmp_dir):
+        """@param works in source expressions (Pass 1)."""
+        config = self._make_config(tmp_dir, [
+            {"name": "offset_amount", "source": "amount + @base_offset", "dtype": "float64"},
+        ], parameters={"base_offset": 50.0})
+
+        result = EntityPipeline(config=config).run()
+        assert list(result.dataframe["offset_amount"]) == [150.0, 250.0, 350.0]
+
+    def test_param_in_post_filter(self, tmp_dir):
+        """@param works in post_filters."""
+        config = self._make_config(tmp_dir, [],
+            parameters={"min_amount": 150.0},
+            post_filters=["amount >= @min_amount"],
+        )
+        result = EntityPipeline(config=config).run()
+        assert len(result.entities) == 2
+        assert [e.id for e in result.entities] == ["B", "C"]
+
+    def test_param_in_pre_filter(self, tmp_dir):
+        """@param works in pre_filters."""
+        config = self._make_config(tmp_dir, [],
+            parameters={"cutoff": 250.0},
+            pre_filters=["amount <= @cutoff"],
+        )
+        result = EntityPipeline(config=config).run()
+        assert len(result.entities) == 2
+        assert [e.id for e in result.entities] == ["A", "B"]
+
+    def test_runtime_param_overrides_config_default(self, tmp_dir):
+        """Runtime parameters override config defaults in expressions."""
+        config = self._make_config(tmp_dir, [
+            {"name": "scaled", "derived": "amount * @factor", "dtype": "float64"},
+        ], parameters={"factor": 1.0})
+
+        # Config default factor=1.0, runtime overrides to 10.0
+        result = EntityPipeline(config=config).run(parameters={"factor": 10.0})
+        assert list(result.dataframe["scaled"]) == [1000.0, 2000.0, 3000.0]
+
+    def test_lambda_with_multiple_params(self, tmp_dir):
+        """Lambda can reference multiple parameters."""
+        config = self._make_config(tmp_dir, [
+            {
+                "name": "calc",
+                "derived": "lambda row: row['amount'] * scale + offset",
+                "dtype": "float64",
+            },
+        ], parameters={"scale": 2.0, "offset": 10.0})
+
+        result = EntityPipeline(config=config).run()
+        assert list(result.dataframe["calc"]) == [210.0, 410.0, 610.0]
