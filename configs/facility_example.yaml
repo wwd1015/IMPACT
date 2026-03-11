@@ -187,7 +187,7 @@ fields:
     description: "One-to-many collateral positions (nested DataFrame)"
 
   - name: available_capacity
-    source: "facility_main.commitment_amount - facility_main.outstanding_balance"
+    source: "commitment_amount - outstanding_balance"
     dtype: float64
     description: "Undrawn commitment capacity"
     temp: true                     # intermediate — used by derived fields, not on entity class

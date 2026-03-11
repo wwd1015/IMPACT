@@ -142,7 +142,7 @@ fields:
     entity_ref: Collateral
 
   - name: available_capacity
-    source: "facility_main.commitment_amount - facility_main.outstanding_balance"
+    source: "commitment_amount - outstanding_balance"
     dtype: float64
     temp: true
 
