@@ -57,6 +57,10 @@ class SubEntityProcessor:
     def process(self, df: pd.DataFrame) -> SubEntityResult:
         """Process a nested DataFrame through the sub-entity pipeline.
 
+        When a top-level config is reused as a sub-entity config, fields
+        whose source columns don't exist in the nested DataFrame are
+        automatically skipped (they belong to the parent pipeline context).
+
         Args:
             df: A single nested DataFrame (one cell from the parent entity).
 
@@ -67,8 +71,11 @@ class SubEntityProcessor:
             TransformError: If field processing fails.
             ValidationError: If validation fails with severity=error.
         """
+        # Filter fields to only those resolvable from the nested DataFrame
+        available_fields = self._resolve_available_fields(df)
+
         if df.empty:
-            entity_fields = [f for f in self.config.fields if not f.temp]
+            entity_fields = [f for f in available_fields if not f.temp]
             entity_cls = self._builder.build_class(
                 self.config.entity.name, entity_fields
             )
@@ -82,29 +89,29 @@ class SubEntityProcessor:
         result = df.copy()
 
         # Pass 1: source fields (rename → cast → fill_na)
-        result = self._apply_source_fields(result)
+        result = self._apply_source_fields(result, available_fields)
 
         # Source field validations
-        report = self._run_field_validations(result, pass_filter="source")
+        report = self._run_field_validations(result, available_fields, pass_filter="source")
         if report.has_errors:
             raise ValidationError(report=report, message=report.format_detail())
 
         # Pass 2: derived fields (eval → cast → fill_na)
-        result = self._apply_derived_fields(result)
+        result = self._apply_derived_fields(result, available_fields)
 
         # Derived field validations
-        derived_report = self._run_field_validations(result, pass_filter="derived")
+        derived_report = self._run_field_validations(result, available_fields, pass_filter="derived")
         report.results.extend(derived_report.results)
         if report.has_errors:
             raise ValidationError(report=report, message=report.format_detail())
 
         # Recursive sub-entity processing (e.g. Facility → Collateral)
         sub_entity_classes = process_sub_entity_fields(
-            self.config.fields, result, report, self.config_path
+            available_fields, result, report, self.config_path
         )
 
         # Build entity class and instances
-        entity_fields = [f for f in self.config.fields if not f.temp]
+        entity_fields = [f for f in available_fields if not f.temp]
         entity_cols = [f.name for f in entity_fields if f.name in result.columns]
         entity_df = result[entity_cols]
 
@@ -121,29 +128,69 @@ class SubEntityProcessor:
             validation_report=report,
         )
 
+    def _resolve_available_fields(self, df: pd.DataFrame) -> list[FieldConfig]:
+        """Filter config fields to those resolvable from the nested DataFrame.
+
+        Source fields are kept if their resolved column exists in the DataFrame.
+        Derived fields are kept if all referenced source fields are available.
+        This allows a top-level pipeline config to be reused as a sub-entity
+        config — fields from the parent context are automatically skipped.
+        """
+        if df.empty:
+            return list(self.config.fields)
+
+        available_cols = set(df.columns)
+        source_prefixes = {s.name for s in self.config.sources}
+
+        # Pass 1: determine which source fields are available
+        available: list[FieldConfig] = []
+        available_names: set[str] = set(available_cols)
+
+        for field in self.config.fields:
+            if field.source is not None:
+                stripped = strip_source_prefixes(field.source, source_prefixes)
+                # Column reference (identifier) — must exist in DataFrame
+                if stripped.isidentifier():
+                    col = field.name if stripped == field.name else stripped
+                    if col in available_cols or field.name in available_cols:
+                        available.append(field)
+                        available_names.add(field.name)
+                    else:
+                        logger.debug(
+                            "  Sub-entity '%s': skipping field '%s' (column '%s' not in nested DataFrame)",
+                            self.config.entity.name, field.name, col,
+                        )
+                else:
+                    # Expression — try to check if referenced columns exist
+                    available.append(field)
+                    available_names.add(field.name)
+            elif field.derived is not None:
+                # Derived fields are included; they'll fail at eval time if deps missing
+                available.append(field)
+                available_names.add(field.name)
+
+        return available
+
     # ------------------------------------------------------------------
     # Field processing (mirrors EntityPipeline logic)
     # ------------------------------------------------------------------
 
-    def _apply_source_fields(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Pass 1 — rename/expr → cast → fill_na for source fields.
-
-        If the config defines sources (reused top-level config), their names are
-        used for source-prefix stripping — same logic as the main pipeline.
-        """
+    def _apply_source_fields(
+        self, df: pd.DataFrame, fields: list[FieldConfig],
+    ) -> pd.DataFrame:
+        """Pass 1 — rename/expr → cast → fill_na for source fields."""
         result = df
         source_prefixes = {s.name for s in self.config.sources}
         err_ctx = f"Sub-entity '{self.config.entity.name}', "
 
-        # Pre-compute stripped sources (avoids re-sorting per field)
         stripped_map = {
             f.name: strip_source_prefixes(f.source, source_prefixes)
-            for f in self.config.fields if f.source is not None
+            for f in fields if f.source is not None
         }
 
         # Batch renames
         rename_map: dict[str, str] = {}
-        for field in self.config.fields:
+        for field in fields:
             if field.source is None:
                 continue
             stripped = stripped_map[field.name]
@@ -153,7 +200,7 @@ class SubEntityProcessor:
             result = result.rename(columns=rename_map)
 
         # Per field: expression eval → cast → fill_na
-        for field in self.config.fields:
+        for field in fields:
             if field.source is None:
                 continue
             stripped = stripped_map[field.name]
@@ -172,11 +219,13 @@ class SubEntityProcessor:
 
         return result
 
-    def _apply_derived_fields(self, df: pd.DataFrame) -> pd.DataFrame:
+    def _apply_derived_fields(
+        self, df: pd.DataFrame, fields: list[FieldConfig],
+    ) -> pd.DataFrame:
         """Pass 2 — derived expressions after all source fields are clean."""
         result = df
         err_ctx = f"Sub-entity '{self.config.entity.name}', "
-        for field in self.config.fields:
+        for field in fields:
             if field.derived is None:
                 continue
             expr = field.derived.strip()
@@ -202,11 +251,12 @@ class SubEntityProcessor:
         return result
 
     def _run_field_validations(
-        self, df: pd.DataFrame, pass_filter: str | None = None
+        self, df: pd.DataFrame, fields: list[FieldConfig],
+        pass_filter: str | None = None,
     ) -> ValidationReport:
         """Run inline validation rules for fields matching pass_filter."""
         report = ValidationReport()
-        for field in self.config.fields:
+        for field in fields:
             for v_cfg in field.build_validation_configs(pass_filter=pass_filter):
                 validator = ValidatorRegistry.get(v_cfg.type)
                 result = validator.validate(df, v_cfg)
@@ -354,27 +404,9 @@ def resolve_sub_entity_config(
             f"Expected a file matching '{snake_name}.yaml' or '{snake_name}_*.yaml'."
         )
 
-    # Parse candidates; prefer configs without sources (sub-entity configs)
-    parsed: list[tuple[Path, EntityConfig]] = []
-    for path in candidate_paths:
-        try:
-            cfg = ConfigParser().parse(path)
-        except Exception:
-            continue
-        parsed.append((path, cfg))
-
-    if not parsed:
-        raise ConfigError(
-            f"Sub-entity config for '{entity_ref}': found files {candidate_paths} "
-            "but none could be parsed."
-        )
-
-    # Prefer sub-entity configs (no sources) over standalone pipeline configs
-    sub_entity_configs = [(p, c) for p, c in parsed if not c.sources]
-    chosen_path, chosen_cfg = (sub_entity_configs or parsed)[0]
-
-    logger.info("Resolved sub-entity '%s' config: %s", entity_ref, chosen_path)
-    return chosen_cfg
+    chosen = candidate_paths[0]
+    logger.info("Resolved sub-entity '%s' config: %s", entity_ref, chosen)
+    return ConfigParser().parse(chosen)
 
 
 def _camel_to_snake(name: str) -> str:
