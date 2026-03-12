@@ -15,7 +15,13 @@ import pandas as pd
 
 from impact.common.exceptions import TransformError, ValidationError
 from impact.common.logging import get_logger
-from impact.common.utils import cast_and_fill, format_lambda_diagnostic, strip_source_prefixes
+from impact.common.utils import (
+    build_expression_namespace,
+    cast_and_fill,
+    enhance_expression_error,
+    format_lambda_diagnostic,
+    strip_source_prefixes,
+)
 from impact.entity.config.parser import ConfigParser
 from impact.entity.config.schema import EntityConfig, FieldConfig
 from impact.entity.model.builder import EntityBuilder
@@ -48,11 +54,17 @@ class SubEntityProcessor:
         result = processor.process(nested_df)
     """
 
-    def __init__(self, config: EntityConfig, config_path: Path | None = None):
+    def __init__(
+        self, config: EntityConfig, config_path: Path | None = None,
+        expression_namespace: dict[str, Any] | None = None,
+    ):
         self.config = config
         self.config_path = config_path
         self._caster = CastTransformer()
         self._builder = EntityBuilder()
+        self._expression_namespace = expression_namespace or build_expression_namespace(
+            config.expression_packages
+        )
 
     def process(self, df: pd.DataFrame) -> SubEntityResult:
         """Process a nested DataFrame through the sub-entity pipeline.
@@ -107,7 +119,8 @@ class SubEntityProcessor:
 
         # Recursive sub-entity processing (e.g. Facility → Collateral)
         sub_entity_classes = process_sub_entity_fields(
-            available_fields, result, report, self.config_path
+            available_fields, result, report, self.config_path,
+            expression_namespace=self._expression_namespace,
         )
 
         # Build entity class and instances
@@ -205,10 +218,11 @@ class SubEntityProcessor:
 
             if not stripped.isidentifier():
                 try:
-                    result[field.name] = result.eval(stripped)
+                    result[field.name] = result.eval(stripped, resolvers=[self._expression_namespace])
                 except Exception as exc:
+                    hint = enhance_expression_error(exc, self.config.expression_packages)
                     raise TransformError(
-                        f"{err_ctx}field '{field.name}': source expression failed: {exc}"
+                        f"{err_ctx}field '{field.name}': source expression failed: {exc}.{hint}"
                     ) from exc
             result = cast_and_fill(
                 result, field.name, field.dtype, field.fill_na,
@@ -223,22 +237,24 @@ class SubEntityProcessor:
         """Pass 2 — derived expressions after all source fields are clean."""
         result = df
         err_ctx = f"Sub-entity '{self.config.entity.name}', "
+        lambda_ns = {"__builtins__": __builtins__, **self._expression_namespace}
         for field in fields:
             if field.derived is None:
                 continue
             expr = field.derived.strip()
             try:
                 if expr.startswith("lambda"):
-                    fn = eval(expr)  # noqa: S307
+                    fn = eval(expr, lambda_ns)  # noqa: S307
                     result[field.name] = result.apply(fn, axis=1)
                 else:
-                    result[field.name] = result.eval(expr)
+                    result[field.name] = result.eval(expr, resolvers=[self._expression_namespace])
             except Exception as exc:
                 diag, samples = "", []
                 if expr.startswith("lambda"):
                     diag, samples = format_lambda_diagnostic(result, fn)
+                hint = enhance_expression_error(exc, self.config.expression_packages)
                 raise TransformError(
-                    f"{err_ctx}field '{field.name}': derived expression failed: {exc}.{diag}",
+                    f"{err_ctx}field '{field.name}': derived expression failed: {exc}.{diag}{hint}",
                     field=field.name,
                     failing_samples=samples,
                 ) from exc
@@ -268,6 +284,7 @@ def process_sub_entity_fields(
     report: ValidationReport,
     config_path: Path | None,
     parent_context: str = "",
+    expression_namespace: dict[str, Any] | None = None,
 ) -> dict[str, type]:
     """Process nested fields with entity_ref through sub-entity pipelines.
 
@@ -281,6 +298,7 @@ def process_sub_entity_fields(
         report: Parent validation report to merge sub-entity results into.
         config_path: Path to the parent config file (for sub-entity resolution).
         parent_context: Optional context prefix from a higher-level parent.
+        expression_namespace: Pre-built package namespace from the parent pipeline.
 
     Returns:
         Mapping of field name → sub-entity class.
@@ -299,7 +317,10 @@ def process_sub_entity_fields(
     for field in nested_fields:
         logger.info("  Processing sub-entity '%s' for field '%s'", field.entity_ref, field.name)
         sub_config = resolve_sub_entity_config(field.entity_ref, config_path)
-        processor = SubEntityProcessor(sub_config, config_path=config_path)
+        processor = SubEntityProcessor(
+            sub_config, config_path=config_path,
+            expression_namespace=expression_namespace,
+        )
 
         entity_lists: list[list] = []
         for idx, cell in enumerate(df[field.name]):

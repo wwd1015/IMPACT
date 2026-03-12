@@ -5,11 +5,35 @@ from __future__ import annotations
 import pytest
 import yaml
 
-from impact.common.exceptions import ConfigError, ValidationError
+from impact.common.exceptions import ConfigError, TransformError, ValidationError
 from impact.entity.config.schema import EntityConfig
 from impact.entity.pipeline import EntityPipeline, PipelineResult
 
 from conftest import write_yaml_config
+
+
+def _build_csv_config(tmp_dir, csv_data, base_fields, extra_fields, **config_overrides):
+    """Shared helper to create a simple CSV-based pipeline config for testing.
+
+    Args:
+        tmp_dir: Temporary directory for the CSV file.
+        csv_data: Dict of column → values for the CSV.
+        base_fields: Base field definitions (always included).
+        extra_fields: Additional field definitions to append.
+        **config_overrides: Top-level config keys (parameters, expression_packages, etc.).
+    """
+    import pandas as pd
+
+    csv_path = tmp_dir / "data.csv"
+    pd.DataFrame(csv_data).to_csv(csv_path, index=False)
+
+    config_dict = {
+        "entity": {"name": "TestEntity"},
+        "sources": [{"name": "main", "type": "csv", "primary": True, "path": str(csv_path)}],
+        "fields": base_fields + extra_fields,
+        **config_overrides,
+    }
+    return EntityConfig.model_validate(config_dict)
 
 
 class TestEntityPipeline:
@@ -135,33 +159,15 @@ class TestPipelineWithoutOptionalSteps:
 class TestParametersInExpressions:
     """Test that @param / param variables work in derived expressions and lambdas."""
 
+    _CSV_DATA = {"id": ["A", "B", "C"], "amount": [100.0, 200.0, 300.0], "rate": [0.05, 0.10, 0.15]}
+    _BASE_FIELDS = [
+        {"name": "id", "source": "id", "dtype": "str", "primary_key": True},
+        {"name": "amount", "source": "amount", "dtype": "float64"},
+        {"name": "rate", "source": "rate", "dtype": "float64"},
+    ]
+
     def _make_config(self, tmp_dir, fields, parameters=None, **extra):
-        """Helper to create a simple config with parameters.
-
-        Args:
-            extra: Additional top-level config keys (e.g. pre_filters, post_filters).
-        """
-        import pandas as pd
-
-        csv_path = tmp_dir / "data.csv"
-        pd.DataFrame({
-            "id": ["A", "B", "C"],
-            "amount": [100.0, 200.0, 300.0],
-            "rate": [0.05, 0.10, 0.15],
-        }).to_csv(csv_path, index=False)
-
-        config_dict = {
-            "entity": {"name": "TestEntity"},
-            "parameters": parameters or {},
-            "sources": [{"name": "main", "type": "csv", "primary": True, "path": str(csv_path)}],
-            "fields": [
-                {"name": "id", "source": "id", "dtype": "str", "primary_key": True},
-                {"name": "amount", "source": "amount", "dtype": "float64"},
-                {"name": "rate", "source": "rate", "dtype": "float64"},
-            ] + fields,
-            **extra,
-        }
-        return EntityConfig.model_validate(config_dict)
+        return _build_csv_config(tmp_dir, self._CSV_DATA, self._BASE_FIELDS, fields, parameters=parameters or {}, **extra)
 
     def test_param_in_derived_eval_expression(self, tmp_dir):
         """@param works in pandas eval derived expressions."""
@@ -300,3 +306,149 @@ class TestDerivedAccessToFullDataFrame:
         assert result.entities[1].is_loan is False
         # Original column not in final entity
         assert not hasattr(result.entities[0], "product_type")
+
+
+class TestExpressionPackages:
+    """Test configurable expression_packages feature."""
+
+    _CSV_DATA = {"id": ["A", "B", "C"], "value": [1.0, 4.0, 9.0]}
+    _BASE_FIELDS = [
+        {"name": "id", "source": "id", "dtype": "str", "primary_key": True},
+        {"name": "value", "source": "value", "dtype": "float64"},
+    ]
+
+    def _make_config(self, tmp_dir, fields, expression_packages=None, **extra):
+        if expression_packages is not None:
+            extra["expression_packages"] = expression_packages
+        return _build_csv_config(tmp_dir, self._CSV_DATA, self._BASE_FIELDS, fields, **extra)
+
+    def test_math_package_in_lambda(self, tmp_dir):
+        """Custom package (math) works in lambda when declared."""
+        config = self._make_config(tmp_dir, [
+            {"name": "root", "derived": "lambda row: math.sqrt(row['value'])", "dtype": "float64"},
+        ], expression_packages={"pd": "pandas", "np": "numpy", "math": "math"})
+        result = EntityPipeline(config=config).run()
+        assert [e.root for e in result.entities] == [1.0, 2.0, 3.0]
+
+    def test_custom_alias(self, tmp_dir):
+        """Custom alias (m → math) works in lambda."""
+        config = self._make_config(tmp_dir, [
+            {"name": "root", "derived": "lambda row: m.sqrt(row['value'])", "dtype": "float64"},
+        ], expression_packages={"pd": "pandas", "np": "numpy", "m": "math"})
+        result = EntityPipeline(config=config).run()
+        assert [e.root for e in result.entities] == [1.0, 2.0, 3.0]
+
+    def test_missing_package_helpful_error(self, tmp_dir):
+        """Using an undeclared package gives a helpful hint in the error."""
+        config = self._make_config(tmp_dir, [
+            {"name": "root", "derived": "lambda row: math.sqrt(row['value'])", "dtype": "float64"},
+        ])
+        with pytest.raises(TransformError, match="expression_packages"):
+            EntityPipeline(config=config).run()
+
+    def test_source_name_conflicts_with_custom_package(self):
+        """Source name that matches an expression_packages alias is rejected."""
+        with pytest.raises(ValueError, match="conflicts with expression package"):
+            EntityConfig.model_validate({
+                "entity": {"name": "Test"},
+                "expression_packages": {"pd": "pandas", "math": "math"},
+                "sources": [{"name": "math", "type": "csv", "primary": True, "path": "/tmp/x.csv"}],
+                "fields": [{"name": "id", "source": "id", "dtype": "str"}],
+            })
+
+    def test_default_packages_when_omitted(self, tmp_dir):
+        """pd and np are available by default even without explicit expression_packages."""
+        config = self._make_config(tmp_dir, [
+            {"name": "root", "derived": "lambda row: np.sqrt(row['value'])", "dtype": "float64"},
+        ])
+        result = EntityPipeline(config=config).run()
+        assert [e.root for e in result.entities] == [1.0, 2.0, 3.0]
+
+
+class TestPandasNumpyInExpressions:
+    """Test that pd/np functions work in derived expressions and lambdas."""
+
+    _CSV_DATA = {"id": ["A", "B", "C"], "amount": [100.0, None, 300.0], "value": [1.0, 4.0, 9.0]}
+    _BASE_FIELDS = [
+        {"name": "id", "source": "id", "dtype": "str", "primary_key": True},
+        {"name": "amount", "source": "amount", "dtype": "float64"},
+        {"name": "value", "source": "value", "dtype": "float64"},
+    ]
+
+    def _make_config(self, tmp_dir, fields, parameters=None, **extra):
+        return _build_csv_config(tmp_dir, self._CSV_DATA, self._BASE_FIELDS, fields, parameters=parameters or {}, **extra)
+
+    def test_pd_isna_in_lambda(self, tmp_dir):
+        """pd.isna() works inside lambda expressions."""
+        config = self._make_config(tmp_dir, [
+            {
+                "name": "is_missing",
+                "derived": "lambda row: pd.isna(row['amount'])",
+                "dtype": "bool",
+            },
+        ])
+        result = EntityPipeline(config=config).run()
+        assert [e.is_missing for e in result.entities] == [False, True, False]
+
+    def test_np_sqrt_in_lambda(self, tmp_dir):
+        """np.sqrt() works inside lambda expressions."""
+        config = self._make_config(tmp_dir, [
+            {
+                "name": "root",
+                "derived": "lambda row: np.sqrt(row['value'])",
+                "dtype": "float64",
+            },
+        ])
+        result = EntityPipeline(config=config).run()
+        assert [e.root for e in result.entities] == [1.0, 2.0, 3.0]
+
+    def test_pd_isna_in_eval(self, tmp_dir):
+        """pd.isna() works in pandas eval expressions (no @ prefix needed)."""
+        config = self._make_config(tmp_dir, [
+            {"name": "is_missing", "derived": "pd.isna(amount)", "dtype": "bool"},
+        ])
+        result = EntityPipeline(config=config).run()
+        assert [e.is_missing for e in result.entities] == [False, True, False]
+
+    def test_np_log_in_eval_via_param(self, tmp_dir):
+        """Custom function passed as parameter works with @param syntax."""
+        import numpy as np
+
+        config = self._make_config(tmp_dir, [
+            {"name": "log_val", "derived": "@log(value)", "dtype": "float64"},
+        ], parameters={"log": np.log})
+        result = EntityPipeline(config=config).run()
+        expected = [float(np.log(v)) for v in [1.0, 4.0, 9.0]]
+        assert list(result.dataframe["log_val"]) == expected
+
+    def test_pd_isna_in_source_expression(self, tmp_dir):
+        """pd.isna() works in source expressions (Pass 1, no @ prefix needed)."""
+        config = self._make_config(tmp_dir, [
+            {"name": "amount_missing", "source": "pd.isna(amount)", "dtype": "bool"},
+        ])
+        result = EntityPipeline(config=config).run()
+        assert list(result.dataframe["amount_missing"]) == [False, True, False]
+
+    def test_pd_fillna_in_lambda(self, tmp_dir):
+        """pd functions work for complex operations in lambdas."""
+        config = self._make_config(tmp_dir, [
+            {
+                "name": "safe_amount",
+                "derived": "lambda row: 0.0 if pd.isna(row['amount']) else row['amount']",
+                "dtype": "float64",
+            },
+        ])
+        result = EntityPipeline(config=config).run()
+        assert list(result.dataframe["safe_amount"]) == [100.0, 0.0, 300.0]
+
+    def test_np_where_in_lambda(self, tmp_dir):
+        """np.where logic works in lambda expressions."""
+        config = self._make_config(tmp_dir, [
+            {
+                "name": "capped",
+                "derived": "lambda row: min(row['value'], np.float64(5.0))",
+                "dtype": "float64",
+            },
+        ])
+        result = EntityPipeline(config=config).run()
+        assert list(result.dataframe["capped"]) == [1.0, 4.0, 5.0]

@@ -55,6 +55,21 @@ class TestConfigSchema:
                 {"name": "c", "type": "csv", "primary": True}
             )
 
+    @pytest.mark.parametrize("unsafe_name", ["os", "sys", "subprocess", "shutil"])
+    def test_unsafe_source_name_rejected(self, unsafe_name):
+        """Source names that are unsafe are rejected at SourceConfig level."""
+        with pytest.raises(ValueError, match="reserved"):
+            SourceConfig.model_validate(
+                {"name": unsafe_name, "type": "csv", "primary": True, "path": "/tmp/x.csv"}
+            )
+
+    @pytest.mark.parametrize("pkg_alias", ["pd", "np"])
+    def test_source_name_conflicts_with_expression_package(self, pkg_alias, minimal_config_dict):
+        """Source names that conflict with expression_packages are rejected at EntityConfig level."""
+        minimal_config_dict["sources"][0]["name"] = pkg_alias
+        with pytest.raises(ValueError, match="conflicts with expression package"):
+            EntityConfig.model_validate(minimal_config_dict)
+
     def test_one_to_many_requires_nested_as(self, minimal_config_dict):
         minimal_config_dict["sources"].append(
             {"name": "secondary", "type": "csv", "path": "/tmp/s.csv"}

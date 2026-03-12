@@ -13,6 +13,16 @@ parameters:
   snapshot_date: "2025-12-31"            # override at runtime: pipeline.run(parameters={"snapshot_date": "..."})
   active_product: "TERM_LOAN"    # override per run: pipeline.run(parameters={"active_product": "REVOLVER"})
 
+# ---------------------------------------------------------------------------
+# Expression packages — Python packages available in eval/lambda expressions.
+# Keys are aliases, values are importable module names.
+# Default: {pd: pandas, np: numpy}. Add more as needed.
+# Source names cannot conflict with these aliases.
+# ---------------------------------------------------------------------------
+expression_packages:
+  pd: pandas
+  np: numpy
+
 # Define Snowflake connection once — reference by name in sources.
 connections:
   lending_db:
@@ -92,21 +102,26 @@ fields:
   #
   # Data origin:
   #   source: col_name              pass-through (primary source — no prefix needed)
-  #   source: src_name.col_name     pass-through or rename (non-primary source)
+  #   source: src_name.col_name     copy to new name (non-primary source; original preserved)
   #   source: "expr"                expression evaluated in Pass 1; src_name. prefix stripped
   #   derived: "expr"               expression evaluated in Pass 2, after all source fields
   #                                 are processed; use field names only — no src prefix needed
   #   derived: "lambda row: ..."    row-wise Python lambda (full row context)
   #
+  # Expressions:
+  #   expression_packages aliases (e.g. pd, np) available directly: pd.isna(col)
+  #   Use @param for external parameters in eval: amount >= @min_amount
+  #   In lambdas, all packages and params are available as bare names
+  #
   # Processing order:
-  #   Pass 1 — source:  rename/expression → cast → fill_na → source field validations
+  #   Pass 1 — source:  copy/expression → cast → fill_na → source field validations
   #   Pass 2 — derived: eval → cast → fill_na → derived field validations
   #   Filters applied after Pass 2
   # ---------------------------------------------------------------------------
 
   # ===========================================================================
   # PASS 1 — SOURCE FIELDS
-  # Loaded directly from source data. Processed first: rename/expr → cast → fill_na → validate.
+  # Loaded directly from source data. Processed first: copy/expr → cast → fill_na → validate.
   # ===========================================================================
 
   - name: facility_id
@@ -128,7 +143,7 @@ fields:
       not_null: error
 
   - name: product_category
-    source: product_type           # rename: product_type → product_category
+    source: product_type           # copy: product_type → product_category (original preserved)
     dtype: str
     fill_na: "UNKNOWN"
 

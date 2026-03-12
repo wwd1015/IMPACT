@@ -48,13 +48,15 @@ src/impact/
 4. **Fail-fast** — Config is fully validated at parse time (Pydantic v2) before any data is touched.
 5. **Severity levels** — Validations use `error` (halt pipeline) or `warning` (log and continue).
 6. **Row-level diagnostics** — On failure, the pipeline identifies the exact rows and values that caused the error. Cast failures show un-castable values, lambda errors show the failing row's data, and sub-entity errors include parent row context (primary key values). All diagnostic work is error-path-only (zero overhead on success).
-7. **Config merge** — IMPACT provides standardized primary configs. Users create sparse custom configs that are merged before parsing. Fields/sources/joins merge by key (custom replaces same-key); connections merge by name (custom wins); pre_filters/post_filters/validations are appended. Use `merge_configs(primary=..., custom=...)` from `impact.entity.config.merger`.
+7. **Config merge** — IMPACT provides standardized primary configs. Users create sparse custom configs that are merged before parsing. Fields/sources/joins merge by key (custom replaces same-key); connections/expression_packages merge by name (custom wins); pre_filters/post_filters/validations are appended. Use `merge_configs(primary=..., custom=...)` from `impact.entity.config.merger`.
+8. **Expression packages** — Configurable packages available in eval/lambda expressions via `expression_packages` config. Default: `{pd: pandas, np: numpy}`. Source names cannot conflict with package aliases. Unsafe names (`os`, `sys`, `subprocess`, `shutil`) are always blocked as source names.
 
 ### YAML Config Structure
 
 ```yaml
 entity:        # [required] Name, description, version
 parameters:    # [optional] Global defaults; overridden by pipeline.run(parameters={...})
+expression_packages:  # [optional] Packages available in expressions; default: {pd: pandas, np: numpy}
 connections:   # [optional] Named connection configs (define once, reference by name in sources)
 sources:       # [required for top-level; omit for sub-entity configs]
 joins:         # [optional] How to combine sources (one_to_one / one_to_many)
@@ -64,7 +66,7 @@ post_filters:  # [optional] Row-level filters applied AFTER field processing (pr
 validations:   # [optional] Global validation rules (applied after field processing)
 ```
 
-`parameters`, `joins`, `connections`, `pre_filters`, `post_filters`, and `validations` are optional. Every top-level pipeline must have `entity`, `sources`, and `fields`. Sub-entity configs (reused top-level configs) need only `entity` and `fields`.
+`expression_packages`, `parameters`, `joins`, `connections`, `pre_filters`, `post_filters`, and `validations` are optional. Every top-level pipeline must have `entity`, `sources`, and `fields`. Sub-entity configs (reused top-level configs) need only `entity` and `fields`.
 
 ### Shared Connections
 
@@ -128,7 +130,8 @@ fields:
     #           original columns + source fields). No src_name prefix needed.
     derived: "<expression>"      #   pandas expression: "col_a / col_b"
                                  #   row-wise lambda:   "lambda row: row['a'] * 2"
-                                 #   Parameters: use @param in eval, variable name in lambda
+                                 #   Parameters: @param in eval, variable name in lambda
+                                 #   pd/np available directly: pd.isna(col) in both eval and lambda
 
     # --- Type casting (required) ---
     dtype: <type>                # cast the column to this type after source/derived.

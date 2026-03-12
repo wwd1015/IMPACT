@@ -16,7 +16,13 @@ import pandas as pd
 
 from impact.common.exceptions import ConfigError, SourceError, TransformError, ValidationError
 from impact.common.logging import get_logger
-from impact.common.utils import cast_and_fill, format_lambda_diagnostic, strip_source_prefixes
+from impact.common.utils import (
+    build_expression_namespace,
+    cast_and_fill,
+    enhance_expression_error,
+    format_lambda_diagnostic,
+    strip_source_prefixes,
+)
 from impact.entity.config.parser import ConfigParser
 from impact.entity.config.schema import EntityConfig, SnowflakeConnectionConfig
 from impact.entity.join.engine import JoinEngine
@@ -100,6 +106,7 @@ class EntityPipeline:
         self.join_engine = JoinEngine()
         self.entity_builder = EntityBuilder()
         self._caster = CastTransformer()
+        self._expression_namespace = build_expression_namespace(self.config.expression_packages)
 
     def run(self, parameters: dict[str, Any] | None = None) -> PipelineResult:
         """Execute the full pipeline.
@@ -125,8 +132,9 @@ class EntityPipeline:
 
         # Resolve effective parameters: global config defaults → runtime overrides
         runtime_params = parameters or {}
-        effective_params: dict[str, Any] = {**self.config.parameters, **runtime_params}
-
+        effective_params: dict[str, Any] = {
+            **self.config.parameters, **runtime_params,
+        }
         # 1. Load all sources
         logger.info("Stage 1/5: Loading sources")
         frames = self._load_sources(runtime_params)
@@ -173,7 +181,8 @@ class EntityPipeline:
 
         # 4b. Process sub-entities (nested fields with entity_ref)
         sub_entity_classes = process_sub_entity_fields(
-            self.config.fields, result_df, report, self.config_path
+            self.config.fields, result_df, report, self.config_path,
+            expression_namespace=self._expression_namespace,
         )
 
         # 5. Drop temp fields, then build entity class and instances
@@ -295,17 +304,19 @@ class EntityPipeline:
     ) -> pd.DataFrame:
         """Apply row-level filter expressions.
 
-        Filters are pandas eval expressions evaluated in order. Use ``@param_name``
-        syntax to reference values from ``parameters`` (e.g. ``status == @active_status``).
+        Filters are pandas eval expressions evaluated in order. Use
+        ``@param`` for external parameters. Packages declared in
+        ``expression_packages`` are available directly (e.g. ``pd.isna(col)``).
         """
         result = df
         for condition in filters:
             before = len(result)
             try:
-                mask = result.eval(condition, local_dict=parameters)
+                mask = result.eval(condition, resolvers=[self._expression_namespace], local_dict=parameters)
                 result = result.loc[mask].reset_index(drop=True)
             except Exception as exc:
-                raise TransformError(f"Filter '{condition}' failed: {exc}") from exc
+                hint = enhance_expression_error(exc, self.config.expression_packages)
+                raise TransformError(f"Filter '{condition}' failed: {exc}.{hint}") from exc
             logger.info("  Filter '%s': %d → %d rows", condition, before, len(result))
         return result
 
@@ -322,7 +333,8 @@ class EntityPipeline:
         so the original column remains available for derived fields in Pass 2.
         Only fields declared in the config are kept in the final entity.
 
-        Parameters are available in expressions via ``@param_name`` syntax.
+        ``pd`` and ``np`` are available directly (e.g. ``pd.isna(col)``).
+        Use ``@param`` for external parameters.
         """
         params = parameters or {}
         result = df.copy()
@@ -356,11 +368,14 @@ class EntityPipeline:
             if not stripped.isidentifier():
                 # Source is an expression — evaluate it
                 try:
-                    result[field.name] = result.eval(stripped, local_dict=params)
+                    result[field.name] = result.eval(
+                        stripped, resolvers=[self._expression_namespace], local_dict=params,
+                    )
                 except Exception as exc:
+                    hint = enhance_expression_error(exc, self.config.expression_packages)
                     raise TransformError(
                         f"Field '{field.name}': failed to evaluate source expression "
-                        f"'{field.source}': {exc}"
+                        f"'{field.source}': {exc}.{hint}"
                     ) from exc
                 logger.info("  Field '%s': computed from source expression", field.name)
 
@@ -377,12 +392,12 @@ class EntityPipeline:
         validated. Use field names only — no ``src_name.`` prefix needed or expected.
         Supports pandas expressions and row-wise lambdas.
 
-        Parameters are available via:
-        - ``@param_name`` in pandas eval expressions
-        - Direct variable name in lambdas (e.g. ``lambda row: row['a'] * threshold``)
+        Packages from ``expression_packages`` are available directly in both
+        eval expressions and lambdas. Use ``@param`` for external parameters
+        in eval; bare names in lambdas.
         """
         params = parameters or {}
-        lambda_ns = {"__builtins__": __builtins__, **params}
+        lambda_ns = {"__builtins__": __builtins__, **self._expression_namespace, **params}
         result = df
         for field in self.config.fields:
             if field.derived is None:
@@ -393,14 +408,15 @@ class EntityPipeline:
                     fn = eval(expr, lambda_ns)  # noqa: S307
                     result[field.name] = result.apply(fn, axis=1)
                 else:
-                    result[field.name] = result.eval(expr, local_dict=params)
+                    result[field.name] = result.eval(expr, resolvers=[self._expression_namespace], local_dict=params)
             except Exception as exc:
                 diag, samples = "", []
                 if expr.startswith("lambda"):
                     diag, samples = format_lambda_diagnostic(result, fn)
+                hint = enhance_expression_error(exc, self.config.expression_packages)
                 raise TransformError(
                     f"Field '{field.name}': derived expression "
-                    f"'{field.derived}' failed: {exc}.{diag}",
+                    f"'{field.derived}' failed: {exc}.{diag}{hint}",
                     field=field.name,
                     failing_samples=samples,
                 ) from exc

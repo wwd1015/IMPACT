@@ -118,6 +118,21 @@ entity:
 
 ---
 
+#### `expression_packages`
+
+Packages available in expressions (both `eval` and `lambda`). Keys are aliases used in expressions, values are importable Python module names. Defaults to `{pd: pandas, np: numpy}` when omitted.
+
+```yaml
+expression_packages:
+  pd: pandas        # pd.isna(), pd.to_numeric()
+  np: numpy         # np.sqrt(), np.log()
+  math: math        # math.sqrt(), math.log10()
+```
+
+Source names cannot conflict with these aliases. If you use a package function without declaring it, the error message will suggest adding it to `expression_packages`.
+
+---
+
 #### `parameters`
 
 Global default values shared across all sources and filters. The orchestration layer (Airflow, CLI, etc.) overrides these at runtime via `pipeline.run(parameters={...})`. A source's own `parameters` block overrides the global default for that source only.
@@ -145,9 +160,12 @@ connection:
 | `${VAR}` | Any YAML string value | Environment variable (resolved at config parse time) | `account: "${SNOWFLAKE_ACCOUNT}"` |
 | `{param}` | SQL `query` in SQLite/Snowflake sources | Parameter value (string-interpolated before query execution) | `FROM {source_table} WHERE date = '{snapshot_date}'` |
 | `@param` | `pre_filters`, `post_filters`, source/derived `eval` expressions | External parameter (not a DataFrame column) | `"amount * @scale_factor"`, `"amount >= @min_amount"` |
+| `alias.func()` | `eval` expressions and lambda expressions | Package function (from `expression_packages`) | `"pd.isna(amount)"`, `"math.log(value)"` |
 | `row['col']` | `derived` lambda expressions | DataFrame column value for the current row | `"lambda row: row['amount'] * scale"` — `row['amount']` is a column, `scale` is a parameter |
 
-In pandas eval expressions (`source`, `derived`, filters), bare names like `amount` refer to **DataFrame columns**. The `@` prefix distinguishes **external parameters** from columns. In lambda expressions, `row['col']` accesses columns and bare names like `scale` are parameters from the `parameters` dict.
+In pandas eval expressions (`source`, `derived`, filters), bare names like `amount` refer to **DataFrame columns**. The `@` prefix marks **external parameters** — use `@param` to distinguish them from columns. Packages declared in `expression_packages` are available directly by alias (e.g. `pd.isna()`, `math.sqrt()`). In lambda expressions, `row['col']` accesses columns, bare names are parameters, and all expression packages are available directly.
+
+> **Note:** Source names cannot conflict with `expression_packages` aliases (e.g. `pd`, `np`). Additionally, `os`, `sys`, `subprocess`, `shutil` are always blocked as source names.
 
 ---
 
@@ -470,6 +488,16 @@ Derived fields run after Pass 1 and have access to the **full DataFrame** — al
 - name: total_collateral_value
   derived: "lambda row: row['collateral_items']['collateral_value'].sum() if not row['collateral_items'].empty else 0.0"
   dtype: float64
+
+# expression_packages aliases are available directly (pd and np by default)
+- name: amount_missing
+  derived: "pd.isna(amount)"
+  dtype: bool
+
+# Same packages available in lambda expressions
+- name: safe_amount
+  derived: "lambda row: 0.0 if pd.isna(row['amount']) else row['amount']"
+  dtype: float64
 ```
 
 ---
@@ -556,6 +584,7 @@ result = EntityPipeline(config=config).run()
 | Section | Strategy | Example |
 |---|---|---|
 | `entity` | Custom overrides individual keys | Change `version` without touching `name` |
+| `expression_packages` | Dict merge, custom wins on conflict | Add `math: math` while keeping `pd` and `np` |
 | `parameters` | Dict merge, custom wins on conflict | Override `active_product` while keeping `snapshot_date` |
 | `sources` | Merge by `name`; same name = replace entirely; new = added | Swap a Snowflake source for CSV in dev |
 | `joins` | Merge by `(left, right)` pair; same pair = replace; new = added | Change join type or add new joins |

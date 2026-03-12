@@ -23,6 +23,14 @@ parameters:
   snapshot_date: "2025-12-31"
 
 # ---------------------------------------------------------------------------
+# Expression packages — Python packages available in eval/lambda expressions.
+# Default: {pd: pandas, np: numpy}. Omit to use defaults only.
+# ---------------------------------------------------------------------------
+expression_packages:
+  pd: pandas
+  np: numpy
+
+# ---------------------------------------------------------------------------
 # Connections — define once, reference by name in sources.
 # Avoids repeating credentials when multiple sources use the same Snowflake
 # account. The pipeline reuses a single connection object at runtime.

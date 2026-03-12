@@ -38,7 +38,7 @@ from impact.entity.config.schema import EntityConfig
 
 logger = get_logger(__name__)
 
-_KNOWN_SECTIONS = {"entity", "parameters", "connections", "sources", "joins", "pre_filters", "post_filters", "fields", "validations"}
+_KNOWN_SECTIONS = {"entity", "expression_packages", "parameters", "connections", "sources", "joins", "pre_filters", "post_filters", "fields", "validations"}
 
 
 def merge_configs(
@@ -108,6 +108,13 @@ def merge_raw_configs(
         primary.get("entity", {}),
         custom.get("entity", {}),
         section="entity",
+    )
+
+    # --- expression_packages ---
+    merged["expression_packages"] = _merge_dict(
+        primary.get("expression_packages", {}),
+        custom.get("expression_packages", {}),
+        section="expression_packages",
     )
 
     # --- parameters ---

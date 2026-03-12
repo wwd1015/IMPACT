@@ -55,6 +55,9 @@ class SourceConfig(BaseModel):
     during config validation.
     """
 
+    # Names that should never be used as source names for security reasons
+    _UNSAFE_NAMES: frozenset[str] = frozenset({"os", "sys", "subprocess", "shutil"})
+
     name: str = Field(..., description="Unique source identifier")
     type: Literal["snowflake", "sqlite", "parquet", "csv", "excel"] = Field(
         ..., description="Source type"
@@ -74,6 +77,10 @@ class SourceConfig(BaseModel):
 
     @model_validator(mode="after")
     def validate_source_fields(self) -> SourceConfig:
+        if self.name in self._UNSAFE_NAMES:
+            raise ValueError(
+                f"Source name '{self.name}' is reserved (unsafe). Choose a different name."
+            )
         if self.type == "snowflake":
             # connection can be a string ref (resolved later by EntityConfig) or inline config
             if self.connection is None or not self.query:
@@ -405,6 +412,15 @@ class EntityConfig(BaseModel):
     """
 
     entity: EntityMeta
+    expression_packages: dict[str, str] = Field(
+        default_factory=lambda: {"pd": "pandas", "np": "numpy"},
+        description=(
+            "Packages available in expressions (eval and lambda). "
+            "Keys are aliases used in expressions, values are importable module names. "
+            "Default: {pd: pandas, np: numpy}. "
+            "Example: {pd: pandas, np: numpy, math: math}"
+        ),
+    )
     parameters: dict[str, Any] = Field(
         default_factory=dict,
         description=(
@@ -484,4 +500,16 @@ class EntityConfig(BaseModel):
                 raise ValueError(f"Join references unknown left source: '{join.left}'")
             if join.right not in source_names:
                 raise ValueError(f"Join references unknown right source: '{join.right}'")
+        return self
+
+    @model_validator(mode="after")
+    def validate_source_names_vs_packages(self) -> EntityConfig:
+        """Ensure no source name conflicts with an expression_packages alias."""
+        for source in self.sources:
+            if source.name in self.expression_packages:
+                raise ValueError(
+                    f"Source name '{source.name}' conflicts with expression package alias "
+                    f"'{source.name}' (maps to '{self.expression_packages[source.name]}'). "
+                    f"Choose a different source name."
+                )
         return self

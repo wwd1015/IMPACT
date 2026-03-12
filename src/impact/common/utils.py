@@ -3,14 +3,64 @@
 from __future__ import annotations
 
 import importlib
+import re
 from typing import Any
 
 import pandas as pd
 
-from impact.common.exceptions import ImpactError, TransformError
+from impact.common.exceptions import ConfigError, ImpactError, TransformError
 from impact.common.logging import get_logger
 
 logger = get_logger(__name__)
+
+
+def build_expression_namespace(expression_packages: dict[str, str]) -> dict[str, Any]:
+    """Import packages declared in ``expression_packages`` and return a namespace dict.
+
+    Keys are aliases (e.g. ``"pd"``), values are the imported module objects.
+
+    Raises:
+        ConfigError: If a package cannot be imported.
+    """
+    namespace: dict[str, Any] = {}
+    for alias, module_name in expression_packages.items():
+        try:
+            namespace[alias] = importlib.import_module(module_name)
+        except ImportError as exc:
+            raise ConfigError(
+                f"Expression package '{alias}: {module_name}' could not be imported: {exc}. "
+                f"Make sure '{module_name}' is installed."
+            ) from exc
+    return namespace
+
+
+def enhance_expression_error(
+    exc: Exception,
+    available_packages: dict[str, str],
+) -> str:
+    """Return a hint suffix when an expression fails due to a missing package.
+
+    Checks if the error references a name that looks like an importable module
+    not declared in ``expression_packages``.
+    """
+    name: str | None = None
+    if isinstance(exc, NameError) and hasattr(exc, "name"):
+        name = exc.name
+    else:
+        # Fallback for wrapped exceptions (e.g. pandas eval wraps NameError)
+        match = re.search(r"name '(\w+)' is not defined", str(exc))
+        if match:
+            name = match.group(1)
+    if name and name not in available_packages:
+        try:
+            importlib.util.find_spec(name)
+            return (
+                f" Hint: '{name}' is not in expression_packages. "
+                f"Add '{name}: {name}' to expression_packages in your config."
+            )
+        except (ModuleNotFoundError, ValueError):
+            pass
+    return ""
 
 
 def import_dotted_path(dotted_path: str, error_class: type[ImpactError] = ImpactError) -> Any:
@@ -43,11 +93,28 @@ def import_dotted_path(dotted_path: str, error_class: type[ImpactError] = Impact
 def strip_source_prefixes(expr: str, source_names: set[str]) -> str:
     """Strip known source-name prefixes from an expression or column reference.
 
+    Only strips ``src_name.identifier`` when it looks like a column reference.
+    Preserves ``pkg.func(...)`` patterns (e.g. ``pd.isna()``, ``np.log()``)
+    by checking whether the identifier is followed by ``(``.
+
     Sorts source names longest-first so that ``"other_facility."`` is stripped
     before ``"facility."`` — avoiding partial substring matches.
     """
     for src in sorted(source_names, key=len, reverse=True):
-        expr = expr.replace(f"{src}.", "")
+        pattern = re.compile(rf"(?<!\w){re.escape(src)}\.(\w+)")
+        parts: list[str] = []
+        last_end = 0
+        for m in pattern.finditer(expr):
+            parts.append(expr[last_end:m.start()])
+            # If the identifier is followed by '(' it's a function call — keep it
+            rest = expr[m.end():]
+            if rest.lstrip().startswith("("):
+                parts.append(m.group(0))
+            else:
+                parts.append(m.group(1))
+            last_end = m.end()
+        parts.append(expr[last_end:])
+        expr = "".join(parts)
     return expr
 
 
