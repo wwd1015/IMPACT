@@ -159,11 +159,11 @@ connection:
 |---|---|---|---|
 | `${VAR}` | Any YAML string value | Environment variable (resolved at config parse time) | `account: "${SNOWFLAKE_ACCOUNT}"` |
 | `{param}` | SQL `query` in SQLite/Snowflake sources | Parameter value (string-interpolated before query execution) | `FROM {source_table} WHERE date = '{snapshot_date}'` |
-| `@param` | `pre_filters`, `post_filters`, source/derived `eval` expressions | External parameter (not a DataFrame column) | `"amount * @scale_factor"`, `"amount >= @min_amount"` |
-| `alias.func()` | `eval` expressions and lambda expressions | Package function (from `expression_packages`) | `"pd.isna(amount)"`, `"math.log(value)"` |
-| `row['col']` | `derived` lambda expressions | DataFrame column value for the current row | `"lambda row: row['amount'] * scale"` — `row['amount']` is a column, `scale` is a parameter |
+| `@param` | `pre_filters`, `post_filters`, source/derived expressions, lambdas | External parameter (not a DataFrame column) | `"amount * @scale_factor"`, `"lambda row: row['a'] * @factor"` |
+| `alias.func()` | `eval` expressions and lambda expressions | Package function (from `expression_packages`) | `"pd.isna(amount)"`, `"lambda row: pd.to_datetime(@snapshot_date)"` |
+| `row['col']` | `derived` lambda expressions | DataFrame column value for the current row | `"lambda row: row['amount'] * @scale"` — `row['amount']` is a column, `@scale` is a parameter |
 
-In pandas eval expressions (`source`, `derived`, filters), bare names like `amount` refer to **DataFrame columns**. The `@` prefix marks **external parameters** — use `@param` to distinguish them from columns. Packages declared in `expression_packages` are available directly by alias (e.g. `pd.isna()`, `math.sqrt()`). In lambda expressions, `row['col']` accesses columns, bare names are parameters, and all expression packages are available directly.
+In all expressions (eval and lambda), use `@param` for **external parameters** to distinguish them from DataFrame columns. Packages declared in `expression_packages` are available directly by alias (e.g. `pd.isna()`, `math.sqrt()`). In lambda expressions, `row['col']` accesses columns. The `@param` syntax works uniformly across eval expressions, lambdas, and filters.
 
 > **Note:** Source names cannot conflict with `expression_packages` aliases (e.g. `pd`, `np`). Additionally, `os`, `sys`, `subprocess`, `shutil` are always blocked as source names.
 
@@ -360,7 +360,7 @@ post_filters:
   - "product_category == @active_product"  # @name references a value from parameters
 ```
 
-Both support `@param_name` syntax to reference runtime parameters. Parameters are also accessible in derived expressions via `@param` (eval) or as variables in lambdas.
+Both support `@param_name` syntax to reference runtime parameters. The `@param` syntax works uniformly in eval expressions, lambda expressions, and filters.
 
 **AND / OR logic within a single filter** — use Python boolean syntax with parentheses for grouping. When conditions are logically related, combine them into one entry:
 

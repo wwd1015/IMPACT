@@ -19,6 +19,7 @@ from impact.common.utils import (
     build_expression_namespace,
     cast_and_fill,
     enhance_expression_error,
+    normalize_lambda_at_params,
     format_lambda_diagnostic,
     strip_source_prefixes,
 )
@@ -242,15 +243,17 @@ class SubEntityProcessor:
             if field.derived is None:
                 continue
             expr = field.derived.strip()
+            fn = None
             try:
                 if expr.startswith("lambda"):
+                    expr = normalize_lambda_at_params(expr)
                     fn = eval(expr, lambda_ns)  # noqa: S307
                     result[field.name] = result.apply(fn, axis=1)
                 else:
                     result[field.name] = result.eval(expr, resolvers=[self._expression_namespace])
             except Exception as exc:
                 diag, samples = "", []
-                if expr.startswith("lambda"):
+                if expr.startswith("lambda") and fn is not None:
                     diag, samples = format_lambda_diagnostic(result, fn)
                 hint = enhance_expression_error(exc, self.config.expression_packages)
                 raise TransformError(

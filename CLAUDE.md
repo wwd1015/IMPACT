@@ -130,7 +130,7 @@ fields:
     #           original columns + source fields). No src_name prefix needed.
     derived: "<expression>"      #   pandas expression: "col_a / col_b"
                                  #   row-wise lambda:   "lambda row: row['a'] * 2"
-                                 #   Parameters: @param in eval, variable name in lambda
+                                 #   Parameters: @param in both eval and lambda
                                  #   pd/np available directly: pd.isna(col) in both eval and lambda
 
     # --- Type casting (required) ---

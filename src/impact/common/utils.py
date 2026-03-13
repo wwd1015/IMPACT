@@ -34,6 +34,19 @@ def build_expression_namespace(expression_packages: dict[str, str]) -> dict[str,
     return namespace
 
 
+def normalize_lambda_at_params(expr: str) -> str:
+    """Strip ``@`` prefixes from parameter references in lambda expressions.
+
+    Allows users to write ``@param`` uniformly in both eval and lambda
+    expressions. In eval, pandas handles ``@param`` natively. In lambdas,
+    this function converts ``@param`` → ``param`` before ``eval()``.
+
+    Returns:
+        The expression with ``@name`` references replaced by bare ``name``.
+    """
+    return re.sub(r"@(\w+)", r"\1", expr)
+
+
 def enhance_expression_error(
     exc: Exception,
     available_packages: dict[str, str],

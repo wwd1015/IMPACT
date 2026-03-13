@@ -452,3 +452,51 @@ class TestPandasNumpyInExpressions:
         ])
         result = EntityPipeline(config=config).run()
         assert list(result.dataframe["capped"]) == [1.0, 4.0, 5.0]
+
+    def test_param_in_pd_function_in_lambda(self, tmp_dir):
+        """External parameter works as argument to pd function inside lambda."""
+        config = self._make_config(tmp_dir, [
+            {
+                "name": "safe_amount",
+                "derived": "lambda row: default_val if pd.isna(row['amount']) else row['amount']",
+                "dtype": "float64",
+            },
+        ], parameters={"default_val": -1.0})
+        result = EntityPipeline(config=config).run(parameters={"default_val": -1.0})
+        assert list(result.dataframe["safe_amount"]) == [100.0, -1.0, 300.0]
+
+    def test_at_param_in_pd_function_in_lambda(self, tmp_dir):
+        """@param syntax works inside pd function calls in lambdas."""
+        config = self._make_config(tmp_dir, [
+            {
+                "name": "result",
+                "derived": "lambda row: str(pd.to_datetime(@snapshot_date))",
+                "dtype": "str",
+            },
+        ], parameters={"snapshot_date": "2025-01-01"})
+        result = EntityPipeline(config=config).run(parameters={"snapshot_date": "2025-01-01"})
+        assert all(e.result == "2025-01-01 00:00:00" for e in result.entities)
+
+    def test_at_param_as_fallback_in_lambda(self, tmp_dir):
+        """@param works as a fallback value with pd.isna() in lambdas."""
+        config = self._make_config(tmp_dir, [
+            {
+                "name": "filled",
+                "derived": "lambda row: @default_val if pd.isna(row['amount']) else row['amount']",
+                "dtype": "float64",
+            },
+        ], parameters={"default_val": 0.0})
+        result = EntityPipeline(config=config).run(parameters={"default_val": 0.0})
+        assert list(result.dataframe["filled"]) == [100.0, 0.0, 300.0]
+
+    def test_at_param_multiple_in_lambda(self, tmp_dir):
+        """Multiple @params work in the same lambda expression."""
+        config = self._make_config(tmp_dir, [
+            {
+                "name": "scaled",
+                "derived": "lambda row: (row['amount'] * @factor + @offset) if not pd.isna(row['amount']) else @offset",
+                "dtype": "float64",
+            },
+        ], parameters={"factor": 2.0, "offset": 10.0})
+        result = EntityPipeline(config=config).run(parameters={"factor": 2.0, "offset": 10.0})
+        assert list(result.dataframe["scaled"]) == [210.0, 10.0, 610.0]
