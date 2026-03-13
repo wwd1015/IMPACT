@@ -246,10 +246,13 @@ class EntityBuilder:
         for _, row in df.iterrows():
             primary_kwargs = {col: _convert_cell_value(row[col]) for col in primary_cols}
 
-            spaces: dict[str, dict[str, Any]] = {
-                space_name: {col: _convert_cell_value(row[col]) for col in cols}
-                for space_name, cols in space_cols.items()
-            }
+            # Build spaces dict, omitting spaces where all values are None
+            # (flag mode: non-matching rows don't get the space)
+            spaces: dict[str, dict[str, Any]] = {}
+            for space_name, cols in space_cols.items():
+                space_dict = {col: _convert_cell_value(row[col]) for col in cols}
+                if any(v is not None for v in space_dict.values()):
+                    spaces[space_name] = space_dict
 
             entities.append(entity_class(**primary_kwargs, spaces=spaces))
 

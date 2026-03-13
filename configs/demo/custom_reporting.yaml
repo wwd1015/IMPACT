@@ -6,19 +6,19 @@
 # each occupies its own space on the entity.
 #
 # Usage (single):
-#   config = merge_configs(
-#       primary="configs/demo/facility_demo.yaml",
+#   result = EntityPipeline(
+#       config="configs/demo/facility_demo.yaml",
 #       custom={"reporting": "configs/demo/custom_reporting.yaml"},
-#   )
+#   ).run()
 #
 # Usage (multiple spaces):
-#   config = merge_configs(
-#       primary="configs/demo/facility_demo.yaml",
+#   result = EntityPipeline(
+#       config="configs/demo/facility_demo.yaml",
 #       custom={
 #           "risk": "configs/demo/custom_risk.yaml",
 #           "reporting": "configs/demo/custom_reporting.yaml",
 #       },
-#   )
+#   ).run()
 # ---------------------------------------------------------------------------
 
 fields:

@@ -48,7 +48,9 @@ src/impact/
 4. **Fail-fast** — Config is fully validated at parse time (Pydantic v2) before any data is touched.
 5. **Severity levels** — Validations use `error` (halt pipeline) or `warning` (log and continue).
 6. **Row-level diagnostics** — On failure, the pipeline identifies the exact rows and values that caused the error. Cast failures show un-castable values, lambda errors show the failing row's data, and sub-entity errors include parent row context (primary key values). All diagnostic work is error-path-only (zero overhead on success).
-7. **Config merge with custom spaces** — IMPACT provides standardized primary configs. Users create sparse custom configs whose fields occupy named "spaces" on the entity. Primary fields are direct dataclass attributes; space fields are stored in a `spaces` dict (plain dicts, not dataclasses). Unique space field names are accessible transparently via `__getattr__`; ambiguous names (same name in multiple spaces) require explicit `entity.spaces["space"]["field"]` access. Custom field names must not overlap with primary field names, but same names across spaces are allowed. Methods: `primary_only()`, `drop_space(name)`, `select_space(name)`, `to_dict()` — all return new copies. The preferred interface is `EntityPipeline(config=..., custom=..., sub_entity_custom=...)` which handles merging internally. Direct `merge_configs(primary=..., custom=...)` from `impact.entity.config.merger` is also available. Custom can be a single path (space auto-named from filename), a list of paths, or a `dict[str, Path]` with explicit space names. Sub-entity custom overrides are keyed by `entity_ref` name (e.g. `{"Collateral": "collateral_risk.yaml"}`).
+7. **Config merge with custom spaces** — IMPACT provides standardized primary configs. Users create sparse custom configs whose fields occupy named "spaces" on the entity. Primary fields are direct dataclass attributes; space fields are stored in a `spaces` dict (plain dicts, not dataclasses). Unique space field names are accessible transparently via `__getattr__`; ambiguous names (same name in multiple spaces) require explicit `entity.spaces["space"]["field"]` access. Custom field names must not overlap with primary field names, but same names across spaces are allowed. Methods: `primary_only()`, `drop_space(name)`, `select_space(name)`, `to_dict()` — all return new copies. The preferred interface is `EntityPipeline(config=..., custom=..., sub_entity_custom=...)` which handles merging internally. Direct `merge_configs(primary=..., custom=...)` from `impact.entity.config.merger` is also available. Custom can be a single path (space auto-named from filename), a list of paths, or a `dict[str, Path]` with explicit space names. Sub-entity custom overrides are keyed by `entity_ref` name (e.g. `{"Collateral": "collateral_risk.yaml"}`). The pipeline supports two filter modes via `custom_filter_mode` parameter on `EntityPipeline`:
+   - `"filter"` (default) — custom pre/post filters are appended to primary filters and reduce the dataset. Use for single-model development where the modeling scope is defined in the custom config.
+   - `"flag"` — custom pre/post filters become row selectors (space selectors). The full dataset is preserved; only matching rows get the custom space applied. Non-matching rows keep primary fields only (no space). Use for composite engines where all models run across the full portfolio. Space fields are computed only for matching rows (non-matching get `None`). Metadata includes `space_selector_counts` with match counts per space. The same custom config works in both modes — the mode is chosen at pipeline creation time, not in the YAML config.
 8. **Expression packages** — Configurable packages available in eval/lambda expressions via `expression_packages` config. Default: `{pd: pandas, np: numpy}`. Source names cannot conflict with package aliases. Unsafe names (`os`, `sys`, `subprocess`, `shutil`) are always blocked as source names.
 
 ### YAML Config Structure
@@ -243,6 +245,13 @@ result = EntityPipeline(
     sub_entity_custom={
         "Collateral": {"risk": "configs/demo/collateral_risk.yaml"},
     },
+).run()
+
+# Flag mode — full dataset preserved, custom filters select rows for space application
+result = EntityPipeline(
+    config="configs/demo/facility_demo.yaml",
+    custom={"risk": "configs/demo/custom_risk.yaml"},
+    custom_filter_mode="flag",
 ).run()
 
 result.entity_class        # Dynamically-created Facility dataclass

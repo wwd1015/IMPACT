@@ -4,15 +4,18 @@
 # This config adds risk-related fields to the Facility entity in a separate
 # "risk" space. Fields here are isolated from primary config fields.
 #
-# Usage:
-#   from impact.entity.config.merger import merge_configs
-#   from impact.entity.pipeline import EntityPipeline
-#
-#   config = merge_configs(
-#       primary="configs/demo/facility_demo.yaml",
+# Usage (filter mode — default, reduces dataset to matching rows):
+#   result = EntityPipeline(
+#       config="configs/demo/facility_demo.yaml",
 #       custom={"risk": "configs/demo/custom_risk.yaml"},
-#   )
-#   result = EntityPipeline(config=config).run()
+#   ).run()
+#
+# Usage (flag mode — full dataset preserved, only matching rows get space):
+#   result = EntityPipeline(
+#       config="configs/demo/facility_demo.yaml",
+#       custom={"risk": "configs/demo/custom_risk.yaml"},
+#       custom_filter_mode="flag",
+#   ).run()
 #
 #   entity = result.entities[0]
 #   entity.facility_id            # primary field — direct attribute

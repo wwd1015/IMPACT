@@ -44,7 +44,7 @@ Usage::
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Literal
 
 from impact.common.exceptions import ConfigError
 from impact.common.logging import get_logger
@@ -59,6 +59,7 @@ _KNOWN_SECTIONS = {"entity", "expression_packages", "parameters", "connections",
 def merge_configs(
     primary: str | Path,
     custom: str | Path | list[str | Path] | dict[str, str | Path] | None = None,
+    custom_filter_mode: Literal["filter", "flag"] = "filter",
 ) -> EntityConfig:
     """Merge a primary IMPACT config with one or more custom overrides.
 
@@ -72,6 +73,10 @@ def merge_configs(
             - ``list[str | Path]`` — multiple configs, each space name = filename stem
             - ``dict[str, str | Path]`` — explicit space names as keys
             - ``None`` — no custom configs (returns primary as-is)
+        custom_filter_mode: How custom config filters are applied:
+            - ``"filter"`` (default) — filters reduce the dataset.
+            - ``"flag"`` — filters become row selectors; full dataset preserved,
+              only matching rows get the custom space applied.
 
     Returns:
         A validated ``EntityConfig`` with merged content.
@@ -86,9 +91,9 @@ def merge_configs(
     custom_spaces = _normalize_custom_input(custom)
 
     if not custom_spaces:
-        merged = merge_raw_configs(primary_raw, {})
+        merged, space_selectors = merge_raw_configs(primary_raw, {})
     else:
-        merged = merge_raw_configs(primary_raw, custom_spaces)
+        merged, space_selectors = merge_raw_configs(primary_raw, custom_spaces, custom_filter_mode=custom_filter_mode)
 
     # Interpolate env vars on the merged result
     merged = ConfigParser.interpolate_env(merged)
@@ -100,6 +105,10 @@ def merge_configs(
 
     # Store primary config path for sub-entity resolution
     config.config_path = Path(primary)
+
+    # Store space selectors (flag mode filters) if any
+    if space_selectors:
+        config.space_selectors = space_selectors
 
     spaces = sorted({f.get("space") for f in merged.get("fields", []) if f.get("space")})
     logger.info(
@@ -159,6 +168,7 @@ def _normalize_custom_input(
 def merge_raw_configs(
     primary: dict[str, Any],
     custom_spaces: dict[str, dict[str, Any]],
+    custom_filter_mode: Literal["filter", "flag"] = "filter",
 ) -> dict[str, Any]:
     """Merge a primary config with multiple custom space configs.
 
@@ -171,10 +181,20 @@ def merge_raw_configs(
         primary: Raw YAML dict for the primary config.
         custom_spaces: Mapping of space_name → raw YAML dict for each custom config.
             Pass an empty dict for no custom configs.
+        custom_filter_mode: How custom config filters are applied:
+            ``"filter"`` (default) — appended to primary filters.
+            ``"flag"`` — stored as space selectors for selective application.
 
     Returns:
-        A new merged dict — inputs are not mutated.
+        A tuple of ``(merged_dict, space_selectors)`` where ``space_selectors``
+        is a dict mapping space names to their selector expressions (empty dict
+        when ``custom_filter_mode="filter"``). Inputs are not mutated.
     """
+    if custom_filter_mode not in ("filter", "flag"):
+        raise ConfigError(
+            f"Invalid custom_filter_mode '{custom_filter_mode}'. "
+            f"Expected 'filter' or 'flag'."
+        )
     # Warn on unknown sections in custom configs
     for space_name, custom in custom_spaces.items():
         unknown = set(custom) - _KNOWN_SECTIONS
@@ -216,10 +236,24 @@ def merge_raw_configs(
     merged["joins"] = result_joins
 
     # --- append sections: pre_filters, post_filters, validations ---
+    # In flag mode, custom filters become space selectors (not appended).
+    space_selectors: dict[str, list[str]] = {}
     for section in ("pre_filters", "post_filters", "validations"):
         result_list = list(primary.get(section, []))
-        for custom in custom_spaces.values():
-            result_list = _merge_append(result_list, custom.get(section, []), section=section)
+        for space_name, custom in custom_spaces.items():
+            custom_entries = custom.get(section, [])
+            if not custom_entries:
+                continue
+            if custom_filter_mode == "flag" and section in ("pre_filters", "post_filters"):
+                # Flag mode: store filters as selectors, don't append
+                space_selectors.setdefault(space_name, []).extend(custom_entries)
+                logger.info(
+                    "  [merge] %s: space '%s' (flag mode): %d entries stored as selectors",
+                    section, space_name, len(custom_entries),
+                )
+            else:
+                # Filter mode (default) or validations: append as before
+                result_list = _merge_append(result_list, custom_entries, section=section)
         merged[section] = result_list
 
     # --- fields: tag custom fields with space, validate no overlap ---
@@ -228,7 +262,7 @@ def merge_raw_configs(
         {name: cfg.get("fields", []) for name, cfg in custom_spaces.items()},
     )
 
-    return merged
+    return merged, space_selectors
 
 
 def _merge_fields_with_spaces(

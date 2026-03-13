@@ -616,6 +616,33 @@ The pipeline handles `merge_configs` internally — no need to call it separatel
 > result = EntityPipeline(config=config).run()  # config carries config_path automatically
 > ```
 
+#### Filter Modes — `custom_filter_mode`
+
+Custom configs often include `pre_filters` and `post_filters`. The `custom_filter_mode` parameter on `EntityPipeline` controls how those filters are applied:
+
+| Mode | Behavior | Use case |
+|---|---|---|
+| `"filter"` (default) | Custom filters are **appended** to primary filters and **reduce the dataset**. All surviving rows get the custom space. | Single-model development — the modeling scope is defined by the custom config. |
+| `"flag"` | Custom filters become **row selectors**. The **full dataset is preserved**. Only matching rows get the custom space applied; non-matching rows keep primary fields only (no space). | Composite engine — all models run across the full portfolio. |
+
+```python
+# Filter mode (default) — 10,000 entities → 300 after custom filters
+result = EntityPipeline(
+    config="configs/facility.yaml",
+    custom={"risk": "configs/custom_risk.yaml"},
+).run()  # custom_filter_mode defaults to "filter"
+
+# Flag mode — 10,000 entities preserved, 300 get risk space applied
+result = EntityPipeline(
+    config="configs/facility.yaml",
+    custom={"risk": "configs/custom_risk.yaml"},
+    custom_filter_mode="flag",
+).run()
+# result.metadata["space_selector_counts"]["risk"] == 300
+```
+
+The **same custom config** works in both modes — the mode is chosen at pipeline creation time, not in the YAML config. In flag mode, space fields for non-matching rows are `None`, and the space is omitted from `entity.spaces` entirely.
+
 #### Entity Structure with Custom Spaces
 
 Custom fields are **not** mixed into the primary entity class. They are stored in a `spaces` dict on the entity, keeping them separate from primary fields. The entity is still a real `dataclass`.
@@ -716,8 +743,8 @@ entity.to_dict()            # {"facility_id": "FAC-001", ..., "risk_score": 0.85
 | `parameters` | Dict merge, custom wins on conflict | Override `active_product` while keeping `snapshot_date` |
 | `sources` | Merge by `name`; same name = replace entirely; new = added | Swap a Snowflake source for CSV in dev |
 | `joins` | Merge by `(left, right)` pair; same pair = replace; new = added | Change join type or add new joins |
-| `pre_filters` | Custom entries appended to primary's | Add early data reduction gates |
-| `post_filters` | Custom entries appended to primary's | Add stricter post-processing gates |
+| `pre_filters` | Filter mode: appended to primary's. Flag mode: stored as row selectors. | Add early data reduction gates |
+| `post_filters` | Filter mode: appended to primary's. Flag mode: stored as row selectors. | Add stricter post-processing gates |
 | `fields` | Custom fields tagged with space and appended; **overlap with primary raises error**; same name across different spaces is allowed | Add `risk_score` to "risk" space |
 | `validations` | Custom entries appended to primary's | Add extra validation rules |
 | `connections` | Dict merge, custom wins on conflict | Override or add named connections |

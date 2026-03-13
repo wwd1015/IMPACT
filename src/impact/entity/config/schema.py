@@ -488,6 +488,11 @@ class EntityConfig(BaseModel):
     # Used by the pipeline to resolve sub-entity config files
     config_path: Path | None = Field(None, exclude=True)
 
+    # Space selectors — set by merge_configs() when custom_filter_mode=flag.
+    # Maps space name → list of filter expressions used as row selectors
+    # (rows matching the filters get the space applied; others don't).
+    space_selectors: dict[str, list[str]] | None = Field(None, exclude=True)
+
     @model_validator(mode="after")
     def resolve_connection_refs(self) -> EntityConfig:
         """Resolve string connection references to actual SnowflakeConnectionConfig objects."""

@@ -10,7 +10,7 @@ from __future__ import annotations
 import dataclasses
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import pandas as pd
 
@@ -91,6 +91,7 @@ class EntityPipeline:
         config: str | Path | EntityConfig | None = None,
         custom: str | Path | list[str | Path] | dict[str, str | Path] | None = None,
         sub_entity_custom: dict[str, str | Path | list[str | Path] | dict[str, str | Path]] | None = None,
+        custom_filter_mode: Literal["filter", "flag"] = "filter",
     ):
         """Initialize the pipeline.
 
@@ -108,6 +109,10 @@ class EntityPipeline:
                     sub_entity_custom={
                         "Collateral": {"risk": "collateral_risk.yaml"},
                     }
+            custom_filter_mode: How custom config filters are applied:
+                ``"filter"`` (default) — filters reduce the dataset.
+                ``"flag"`` — filters become row selectors; full dataset preserved,
+                only matching rows get the custom space applied.
 
         Raises:
             ConfigError: If config is not provided.
@@ -121,7 +126,10 @@ class EntityPipeline:
         elif isinstance(config, (str, Path)):
             config_path = Path(config)
             if custom is not None:
-                self.config = merge_configs(primary=config_path, custom=custom)
+                self.config = merge_configs(
+                    primary=config_path, custom=custom,
+                    custom_filter_mode=custom_filter_mode,
+                )
             else:
                 self.config = ConfigParser().parse(config_path)
             self.config_path = config_path
@@ -180,23 +188,38 @@ class EntityPipeline:
         # 3. Field transforms — two ordered passes
         logger.info("Stage 3/5: Applying transformations")
 
+        # Compute space selector masks (flag mode) after source columns are available
+        space_selectors = getattr(self.config, "space_selectors", None) or {}
+        space_masks: dict[str, pd.Series] = {}
+
         # Pass 1: source fields (rename/expr → cast → fill_na)
-        result_df = self._apply_source_fields(result_df, effective_params)
+        result_df = self._apply_source_fields(result_df, effective_params, space_masks)
+
+        # Compute selector masks after source fields are ready (selectors may reference them)
+        if space_selectors:
+            space_masks = self._compute_space_selector_masks(
+                result_df, effective_params, space_selectors,
+            )
 
         # Validate source fields before derived fields run
-        report = self._run_field_validations(result_df, pass_filter="source")
+        report = self._run_field_validations(result_df, pass_filter="source", space_masks=space_masks)
         if report.has_errors:
             logger.error("Source field validation failed with %d errors", report.error_count)
             raise ValidationError(report=report, message=report.format_detail())
 
         # Pass 2: derived fields (eval → cast → fill_na), then post-filters
-        result_df = self._apply_derived_fields(result_df, effective_params)
+        result_df = self._apply_derived_fields(result_df, effective_params, space_masks)
         if self.config.post_filters:
             result_df = self._apply_filters(result_df, effective_params, self.config.post_filters)
+            # Recompute space masks — post-filters may have dropped rows, invalidating indices
+            if space_selectors:
+                space_masks = self._compute_space_selector_masks(
+                    result_df, effective_params, space_selectors,
+                )
 
         # 4. Validate derived fields + global validations
         logger.info("Stage 4/5: Running validations")
-        derived_report = self._run_field_validations(result_df, pass_filter="derived")
+        derived_report = self._run_field_validations(result_df, pass_filter="derived", space_masks=space_masks)
         global_report = self._run_validations(result_df)
         report.results.extend(derived_report.results)
         report.results.extend(global_report.results)
@@ -243,6 +266,9 @@ class EntityPipeline:
                 "source_count": len(self.config.sources),
                 "record_count": len(result_df),
                 "field_count": len(entity_fields),
+                **({"space_selector_counts": {
+                    space: int(mask.sum()) for space, mask in space_masks.items()
+                }} if space_masks else {}),
             },
             sub_entity_classes=sub_entity_classes,
         )
@@ -350,8 +376,41 @@ class EntityPipeline:
             logger.info("  Filter '%s': %d → %d rows", condition, before, len(result))
         return result
 
+    def _compute_space_selector_masks(
+        self, df: pd.DataFrame, parameters: dict[str, Any],
+        space_selectors: dict[str, list[str]],
+    ) -> dict[str, pd.Series]:
+        """Compute boolean masks for flag-mode space selectors.
+
+        Each space with selectors gets a boolean Series indicating which rows
+        should receive that space's fields. Rows not matching remain unaffected
+        (space fields get ``None``).
+        """
+        masks: dict[str, pd.Series] = {}
+        for space_name, conditions in space_selectors.items():
+            mask = pd.Series(True, index=df.index)
+            for cond in conditions:
+                try:
+                    cond_mask = df.eval(
+                        cond, resolvers=[self._expression_namespace], local_dict=parameters,
+                    )
+                    mask = mask & cond_mask
+                except Exception as exc:
+                    hint = enhance_expression_error(exc, self.config.expression_packages)
+                    raise TransformError(
+                        f"Space selector for '{space_name}': expression '{cond}' failed: {exc}.{hint}"
+                    ) from exc
+            matched = int(mask.sum())
+            logger.info(
+                "  Space '%s' selector: %d / %d rows matched",
+                space_name, matched, len(df),
+            )
+            masks[space_name] = mask
+        return masks
+
     def _apply_source_fields(
         self, df: pd.DataFrame, parameters: dict[str, Any] | None = None,
+        space_masks: dict[str, pd.Series] | None = None,
     ) -> pd.DataFrame:
         """Pass 1 — process all source fields: copy/expr → cast → fill_na.
 
@@ -365,8 +424,12 @@ class EntityPipeline:
 
         ``pd`` and ``np`` are available directly (e.g. ``pd.isna(col)``).
         Use ``@param`` for external parameters.
+
+        When ``space_masks`` is provided, fields belonging to a flagged space
+        are only computed for matching rows; non-matching rows get ``None``.
         """
         params = parameters or {}
+        masks = space_masks or {}
         result = df.copy()
         source_prefixes = {s.name for s in self.config.sources}
 
@@ -386,7 +449,12 @@ class EntityPipeline:
                     raise TransformError(
                         f"Field '{field.name}': source column '{stripped}' not found in DataFrame"
                     )
-                result[field.name] = result[stripped]
+                mask = masks.get(field.space) if field.space else None
+                if mask is not None:
+                    result[field.name] = None
+                    result.loc[mask, field.name] = result.loc[mask, stripped]
+                else:
+                    result[field.name] = result[stripped]
                 logger.info("  Field '%s': copied from '%s'", field.name, stripped)
 
         # Per source field: expression eval → cast → fill_na
@@ -395,12 +463,20 @@ class EntityPipeline:
                 continue
             stripped = stripped_map[field.name]
 
+            mask = masks.get(field.space) if field.space else None
+
             if not stripped.isidentifier():
                 # Source is an expression — evaluate it
                 try:
-                    result[field.name] = result.eval(
-                        stripped, resolvers=[self._expression_namespace], local_dict=params,
-                    )
+                    if mask is not None:
+                        result[field.name] = None
+                        result.loc[mask, field.name] = result.loc[mask].eval(
+                            stripped, resolvers=[self._expression_namespace], local_dict=params,
+                        )
+                    else:
+                        result[field.name] = result.eval(
+                            stripped, resolvers=[self._expression_namespace], local_dict=params,
+                        )
                 except Exception as exc:
                     hint = enhance_expression_error(exc, self.config.expression_packages)
                     raise TransformError(
@@ -410,11 +486,15 @@ class EntityPipeline:
                 logger.info("  Field '%s': computed from source expression", field.name)
 
             result = cast_and_fill(result, field.name, field.dtype, field.fill_na, self._caster)
+            # For flag-mode space fields, reset non-matching rows to None after cast
+            if mask is not None:
+                result.loc[~mask, field.name] = None
 
         return result
 
     def _apply_derived_fields(
         self, df: pd.DataFrame, parameters: dict[str, Any] | None = None,
+        space_masks: dict[str, pd.Series] | None = None,
     ) -> pd.DataFrame:
         """Pass 2 — compute derived fields after all source fields are processed.
 
@@ -425,22 +505,38 @@ class EntityPipeline:
         Packages from ``expression_packages`` are available directly in both
         eval expressions and lambdas. Use ``@param`` for external parameters
         in both eval and lambda expressions.
+
+        When ``space_masks`` is provided, derived fields belonging to a flagged
+        space are only computed for matching rows; non-matching rows get ``None``.
         """
         params = parameters or {}
+        masks = space_masks or {}
         lambda_ns = {"__builtins__": __builtins__, **self._expression_namespace, **params}
         result = df
         for field in self.config.fields:
             if field.derived is None:
                 continue
+
+            mask = masks.get(field.space) if field.space else None
             expr = field.derived.strip()
             fn = None
             try:
                 if expr.startswith("lambda"):
                     expr = normalize_lambda_at_params(expr)
                     fn = eval(expr, lambda_ns)  # noqa: S307
-                    result[field.name] = result.apply(fn, axis=1)
+                    if mask is not None:
+                        result[field.name] = None
+                        result.loc[mask, field.name] = result.loc[mask].apply(fn, axis=1)
+                    else:
+                        result[field.name] = result.apply(fn, axis=1)
                 else:
-                    result[field.name] = result.eval(expr, resolvers=[self._expression_namespace], local_dict=params)
+                    if mask is not None:
+                        result[field.name] = None
+                        result.loc[mask, field.name] = result.loc[mask].eval(
+                            expr, resolvers=[self._expression_namespace], local_dict=params,
+                        )
+                    else:
+                        result[field.name] = result.eval(expr, resolvers=[self._expression_namespace], local_dict=params)
             except Exception as exc:
                 diag, samples = "", []
                 if expr.startswith("lambda") and fn is not None:
@@ -454,11 +550,15 @@ class EntityPipeline:
                 ) from exc
             logger.info("  Field '%s': derived from expression", field.name)
             result = cast_and_fill(result, field.name, field.dtype, field.fill_na, self._caster)
+            # For flag-mode space fields, reset non-matching rows to None after cast
+            if mask is not None:
+                result.loc[~mask, field.name] = None
 
         return result
 
     def _run_field_validations(
-        self, df: pd.DataFrame, pass_filter: str | None = None
+        self, df: pd.DataFrame, pass_filter: str | None = None,
+        space_masks: dict[str, pd.Series] | None = None,
     ) -> ValidationReport:
         """Run inline validation rules for fields matching ``pass_filter``.
 
@@ -466,13 +566,27 @@ class EntityPipeline:
             pass_filter: ``"source"`` — only source fields,
                          ``"derived"`` — only derived fields,
                          ``None`` — all fields.
+            space_masks: When provided, validates flagged-space fields only
+                against matching rows (non-matching rows are excluded).
         """
+        masks = space_masks or {}
         report = ValidationReport()
+        # Cache filtered DataFrames per space (avoid repeated loc + reset_index)
+        space_df_cache: dict[str, pd.DataFrame] = {}
 
         for field in self.config.fields:
+            # For flagged-space fields, validate only matching rows
+            space = field.space
+            if space and space in masks:
+                if space not in space_df_cache:
+                    space_df_cache[space] = df.loc[masks[space]].reset_index(drop=True)
+                validate_df = space_df_cache[space]
+            else:
+                validate_df = df
+
             for v_cfg in field.build_validation_configs(pass_filter=pass_filter):
                 validator = ValidatorRegistry.get(v_cfg.type)
-                result = validator.validate(df, v_cfg)
+                result = validator.validate(validate_df, v_cfg)
                 result.field_name = result.field_name or field.name
                 report.results.append(result)
                 status = "PASS" if result.passed else result.severity.upper()
