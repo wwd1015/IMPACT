@@ -24,6 +24,7 @@ from impact.common.utils import (
     format_lambda_diagnostic,
     strip_source_prefixes,
 )
+from impact.entity.config.merger import merge_configs
 from impact.entity.config.parser import ConfigParser
 from impact.entity.config.schema import EntityConfig, SnowflakeConnectionConfig
 from impact.entity.join.engine import JoinEngine
@@ -85,24 +86,51 @@ class EntityPipeline:
         result = pipeline.run(parameters={"snapshot_date": "2025-06-30"})
     """
 
-    def __init__(self, config_path: str | Path | None = None, config: EntityConfig | None = None):
+    def __init__(
+        self,
+        config: str | Path | EntityConfig | None = None,
+        custom: str | Path | list[str | Path] | dict[str, str | Path] | None = None,
+        sub_entity_custom: dict[str, str | Path | list[str | Path] | dict[str, str | Path]] | None = None,
+    ):
         """Initialize the pipeline.
 
         Args:
-            config_path: Path to the YAML config file.
-            config: Pre-parsed EntityConfig (alternative to config_path).
+            config: Path to a YAML config file, or a pre-parsed ``EntityConfig``.
+            custom: Custom override config(s) for the parent entity. Merged with
+                the primary config via ``merge_configs``. Accepts the same formats:
+                ``str | Path`` (auto-named), ``list`` (auto-named each),
+                ``dict[str, Path]`` (explicit space names).
+                Ignored when ``config`` is already an ``EntityConfig``.
+            sub_entity_custom: Custom override config(s) for sub-entities, keyed
+                by ``entity_ref`` name. Each value uses the same format as
+                ``custom``. Example::
+
+                    sub_entity_custom={
+                        "Collateral": {"risk": "collateral_risk.yaml"},
+                    }
 
         Raises:
-            ConfigError: If neither config_path nor config is provided.
+            ConfigError: If config is not provided.
         """
-        if config is not None:
+        if config is None:
+            raise ConfigError("config must be provided (path or EntityConfig)")
+
+        if isinstance(config, EntityConfig):
             self.config = config
-            self.config_path: Path | None = None
-        elif config_path is not None:
-            self.config_path = Path(config_path)
-            self.config = ConfigParser().parse(config_path)
+            self.config_path: Path | None = getattr(config, "config_path", None)
+        elif isinstance(config, (str, Path)):
+            config_path = Path(config)
+            if custom is not None:
+                self.config = merge_configs(primary=config_path, custom=custom)
+            else:
+                self.config = ConfigParser().parse(config_path)
+            self.config_path = config_path
         else:
-            raise ConfigError("Either config_path or config must be provided")
+            raise ConfigError(
+                f"config must be a path (str/Path) or EntityConfig, got {type(config).__name__}"
+            )
+
+        self.sub_entity_custom = sub_entity_custom or {}
 
         self.join_engine = JoinEngine()
         self.entity_builder = EntityBuilder()
@@ -184,6 +212,7 @@ class EntityPipeline:
         sub_entity_classes = process_sub_entity_fields(
             self.config.fields, result_df, report, self.config_path,
             expression_namespace=self._expression_namespace,
+            sub_entity_custom=self.sub_entity_custom,
         )
 
         # 5. Drop temp fields, then build entity class and instances

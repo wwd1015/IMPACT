@@ -46,7 +46,7 @@ class TestEntityPipeline:
 
     def test_pipeline_from_yaml_file(self, tmp_dir, full_config_dict):
         path = write_yaml_config(full_config_dict, tmp_dir / "config.yaml")
-        pipeline = EntityPipeline(config_path=path)
+        pipeline = EntityPipeline(config=path)
         assert pipeline.config.entity.name == "Facility"
 
     def test_pipeline_no_config_raises(self):

@@ -137,6 +137,7 @@ fields:
     source: facilities
     dtype: nested
     entity_ref: Facility
+    entity_ref_config: "facility_demo.yaml"
 
   # === PASS 2 — DERIVED FIELDS ===
 

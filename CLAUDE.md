@@ -48,7 +48,7 @@ src/impact/
 4. **Fail-fast** — Config is fully validated at parse time (Pydantic v2) before any data is touched.
 5. **Severity levels** — Validations use `error` (halt pipeline) or `warning` (log and continue).
 6. **Row-level diagnostics** — On failure, the pipeline identifies the exact rows and values that caused the error. Cast failures show un-castable values, lambda errors show the failing row's data, and sub-entity errors include parent row context (primary key values). All diagnostic work is error-path-only (zero overhead on success).
-7. **Config merge** — IMPACT provides standardized primary configs. Users create sparse custom configs that are merged before parsing. Fields/sources/joins merge by key (custom replaces same-key); connections/expression_packages merge by name (custom wins); pre_filters/post_filters/validations are appended. Use `merge_configs(primary=..., custom=...)` from `impact.entity.config.merger`.
+7. **Config merge with custom spaces** — IMPACT provides standardized primary configs. Users create sparse custom configs whose fields occupy named "spaces" on the entity. Primary fields are direct dataclass attributes; space fields are stored in a `spaces` dict (plain dicts, not dataclasses). Unique space field names are accessible transparently via `__getattr__`; ambiguous names (same name in multiple spaces) require explicit `entity.spaces["space"]["field"]` access. Custom field names must not overlap with primary field names, but same names across spaces are allowed. Methods: `primary_only()`, `drop_space(name)`, `select_space(name)`, `to_dict()` — all return new copies. The preferred interface is `EntityPipeline(config=..., custom=..., sub_entity_custom=...)` which handles merging internally. Direct `merge_configs(primary=..., custom=...)` from `impact.entity.config.merger` is also available. Custom can be a single path (space auto-named from filename), a list of paths, or a `dict[str, Path]` with explicit space names. Sub-entity custom overrides are keyed by `entity_ref` name (e.g. `{"Collateral": "collateral_risk.yaml"}`).
 8. **Expression packages** — Configurable packages available in eval/lambda expressions via `expression_packages` config. Default: `{pd: pandas, np: numpy}`. Source names cannot conflict with package aliases. Unsafe names (`os`, `sys`, `subprocess`, `shutil`) are always blocked as source names.
 
 ### YAML Config Structure
@@ -230,6 +230,21 @@ result = EntityPipeline("configs/facility_example.yaml").run(
     parameters={"snapshot_date": "2025-12-31"}
 )
 
+# With custom override configs (merged internally)
+result = EntityPipeline(
+    config="configs/demo/facility_demo.yaml",
+    custom={"risk": "configs/demo/custom_risk.yaml"},
+).run()
+
+# With sub-entity custom overrides
+result = EntityPipeline(
+    config="configs/demo/obligor_demo.yaml",
+    custom={"risk": "configs/demo/custom_risk.yaml"},
+    sub_entity_custom={
+        "Collateral": {"risk": "configs/demo/collateral_risk.yaml"},
+    },
+).run()
+
 result.entity_class        # Dynamically-created Facility dataclass
 result.entities            # List of Facility instances
 result.dataframe           # Processed pandas DataFrame
@@ -302,7 +317,7 @@ Joins execute in config order. Each result updates `resolved[join_cfg.left]`, so
 - `nested` with `entity_ref` maps to `list` (of sub-entity instances); without `entity_ref` maps to `pd.DataFrame`
 - Primary key fields have no default in the generated dataclass; all others default to `None`
 - The generated class gets `__entity_fields__`, `__primary_key__`, and `__entity_name__` attributes
-- Sub-entity configs are resolved by convention: `{snake_case(entity_ref)}.yaml` or `{snake_case(entity_ref)}_*.yaml` (glob matching) in the parent config's directory
+- Sub-entity configs are resolved by `entity_ref_config` (explicit filename) or by convention: `{snake_case(entity_ref)}.yaml` or `{snake_case(entity_ref)}_*.yaml` (glob matching) in the parent config's directory. Use `entity_ref_config` when multiple matching files exist to avoid ambiguity
 
 ### Custom Functions (Transform / Validator)
 

@@ -140,6 +140,7 @@ fields:
     source: collateral_items
     dtype: nested
     entity_ref: Collateral
+    entity_ref_config: "collateral_demo.yaml"
 
   - name: available_capacity
     source: "commitment_amount - outstanding_balance"

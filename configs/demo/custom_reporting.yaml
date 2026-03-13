@@ -1,0 +1,34 @@
+# ---------------------------------------------------------------------------
+# Custom Reporting Config — custom override for facility_demo.yaml
+#
+# This config adds reporting-related fields to the Facility entity in a
+# separate "reporting" space. Can be used alongside custom_risk.yaml —
+# each occupies its own space on the entity.
+#
+# Usage (single):
+#   config = merge_configs(
+#       primary="configs/demo/facility_demo.yaml",
+#       custom={"reporting": "configs/demo/custom_reporting.yaml"},
+#   )
+#
+# Usage (multiple spaces):
+#   config = merge_configs(
+#       primary="configs/demo/facility_demo.yaml",
+#       custom={
+#           "risk": "configs/demo/custom_risk.yaml",
+#           "reporting": "configs/demo/custom_reporting.yaml",
+#       },
+#   )
+# ---------------------------------------------------------------------------
+
+fields:
+  - name: report_flag
+    derived: "lambda row: row['commitment_amount'] >= 1_000_000"
+    dtype: bool
+
+  - name: report_category
+    derived: "lambda row: 'LARGE' if row['commitment_amount'] >= 5_000_000 else ('MEDIUM' if row['commitment_amount'] >= 1_000_000 else 'SMALL')"
+    dtype: str
+
+post_filters:
+  - "report_flag == True"

@@ -56,6 +56,8 @@ class ConfigParser:
         except Exception as exc:
             raise ConfigError(f"Config validation failed: {exc}") from exc
 
+        config.config_path = path
+
         logger.info(
             "Config parsed successfully: entity=%s, sources=%d, joins=%d, pre_filters=%d, post_filters=%d, validations=%d, fields=%d",
             config.entity.name,

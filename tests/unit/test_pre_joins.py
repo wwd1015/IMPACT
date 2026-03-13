@@ -78,7 +78,7 @@ class TestPreJoins:
         }
 
         config_path = write_yaml_config(config_dict, tmp_dir / "obligor.yaml")
-        pipeline = EntityPipeline(config_path=config_path)
+        pipeline = EntityPipeline(config=config_path)
         result = pipeline.run()
 
         assert len(result.entities) == 2
@@ -126,7 +126,7 @@ class TestPreJoins:
         }
 
         config_path = write_yaml_config(config_dict, tmp_dir / "test.yaml")
-        result = EntityPipeline(config_path=config_path).run()
+        result = EntityPipeline(config=config_path).run()
 
         assert len(result.entities) == 2
         # A has 2 detail items
@@ -142,7 +142,7 @@ class TestPipelineConfigPath:
             "fields": [{"name": "x", "source": "x", "dtype": "str"}],
         }
         config_path = write_yaml_config(config_dict, tmp_dir / "test.yaml")
-        pipeline = EntityPipeline(config_path=config_path)
+        pipeline = EntityPipeline(config=config_path)
         assert pipeline.config_path == config_path
 
     def test_config_path_none_when_config_object(self):

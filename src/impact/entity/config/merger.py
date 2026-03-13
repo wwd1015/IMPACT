@@ -1,29 +1,44 @@
-"""Config merger — combines a primary (IMPACT standard) config with a custom override.
+"""Config merger — combines a primary (IMPACT standard) config with custom overrides.
 
-The primary config is always the base. The custom config is sparse — users only
-define what's different. Merge happens at the raw YAML dict level, before
-Pydantic parsing.
+The primary config is always the base. Custom configs are sparse — users only
+define what's different. Each custom config's fields occupy a named "space"
+on the entity, isolated from primary fields and from each other.
 
 Merge semantics by section:
 
 - ``entity``: custom overrides individual keys (name, version, description)
 - ``parameters``: dict merge, custom wins on key conflict
+- ``expression_packages``: dict merge, custom wins on key conflict
+- ``connections``: dict merge, custom wins on key conflict
 - ``sources``: merge by ``name``; same name = custom replaces; new names added
 - ``joins``: merge by ``(left, right)``; same pair = custom replaces; new pairs added
-- ``pre_filters``: custom's pre_filters are appended to primary's
-- ``post_filters``: custom's post_filters are appended to primary's
-- ``fields``: merge by ``name``; same name = custom replaces entirely; new names added
-- ``validations``: custom's validations are appended to primary's
+- ``pre_filters``: custom entries appended to primary
+- ``post_filters``: custom entries appended to primary
+- ``fields``: custom fields are tagged with their space name and appended.
+  Field name overlap between primary and custom raises ``ConfigError``.
+- ``validations``: custom entries appended to primary
 
 Usage::
 
     from impact.entity.config.merger import merge_configs
 
+    # Single custom config (space name auto-derived from filename)
+    config = merge_configs("configs/facility.yaml", custom="custom_risk.yaml")
+
+    # Single custom config with explicit space name
+    config = merge_configs("configs/facility.yaml", custom={"risk": "custom_risk.yaml"})
+
+    # Multiple custom configs
     config = merge_configs(
-        primary="configs/facility_example.yaml",
-        custom="user_configs/facility_custom.yaml",
+        "configs/facility.yaml",
+        custom={"risk": "risk.yaml", "reporting": "report.yaml"},
     )
-    result = EntityPipeline(config=config).run()
+
+    # Multiple custom configs without explicit names (auto from filenames)
+    config = merge_configs(
+        "configs/facility.yaml",
+        custom=["risk_fields.yaml", "report_fields.yaml"],
+    )
 """
 
 from __future__ import annotations
@@ -43,29 +58,37 @@ _KNOWN_SECTIONS = {"entity", "expression_packages", "parameters", "connections",
 
 def merge_configs(
     primary: str | Path,
-    custom: str | Path,
+    custom: str | Path | list[str | Path] | dict[str, str | Path] | None = None,
 ) -> EntityConfig:
-    """Merge a primary IMPACT config with a custom override and return a parsed config.
+    """Merge a primary IMPACT config with one or more custom overrides.
 
-    The primary config is always the base, regardless of argument order. The
-    custom config is sparse — users only include sections and fields they want
-    to change or add.
+    Each custom config's fields occupy a named "space" on the entity.
+    Field names in custom configs must not overlap with primary field names.
 
     Args:
         primary: Path to the IMPACT standard config (the base).
-        custom: Path to the user's custom override config.
+        custom: Custom override config(s). Accepts:
+            - ``str | Path`` — single config, space name = filename stem
+            - ``list[str | Path]`` — multiple configs, each space name = filename stem
+            - ``dict[str, str | Path]`` — explicit space names as keys
+            - ``None`` — no custom configs (returns primary as-is)
 
     Returns:
         A validated ``EntityConfig`` with merged content.
 
     Raises:
-        ConfigError: If either file cannot be read, parsed, or the merged result
-            fails validation.
+        ConfigError: If files cannot be read/parsed, field names overlap,
+            or the merged result fails validation.
     """
     primary_raw = ConfigParser.load_yaml(Path(primary))
-    custom_raw = ConfigParser.load_yaml(Path(custom))
 
-    merged = merge_raw_configs(primary_raw, custom_raw)
+    # Normalize custom into dict[space_name, raw_config]
+    custom_spaces = _normalize_custom_input(custom)
+
+    if not custom_spaces:
+        merged = merge_raw_configs(primary_raw, {})
+    else:
+        merged = merge_raw_configs(primary_raw, custom_spaces)
 
     # Interpolate env vars on the merged result
     merged = ConfigParser.interpolate_env(merged)
@@ -75,108 +98,182 @@ def merge_configs(
     except Exception as exc:
         raise ConfigError(f"Merged config validation failed: {exc}") from exc
 
+    # Store primary config path for sub-entity resolution
+    config.config_path = Path(primary)
+
+    spaces = sorted({f.get("space") for f in merged.get("fields", []) if f.get("space")})
     logger.info(
-        "Merged config parsed: entity=%s, sources=%d, joins=%d, pre_filters=%d, post_filters=%d, fields=%d",
+        "Merged config parsed: entity=%s, sources=%d, joins=%d, pre_filters=%d, "
+        "post_filters=%d, fields=%d (spaces: %s)",
         config.entity.name,
         len(config.sources),
         len(config.joins or []),
         len(config.pre_filters or []),
         len(config.post_filters or []),
         len(config.fields),
+        spaces or ["primary only"],
     )
     return config
 
 
+def _normalize_custom_input(
+    custom: str | Path | list[str | Path] | dict[str, str | Path] | None,
+) -> dict[str, dict[str, Any]]:
+    """Convert custom input to a dict of space_name → raw YAML config."""
+    if custom is None:
+        return {}
+
+    if isinstance(custom, dict):
+        # Explicit space names
+        return {
+            name: ConfigParser.load_yaml(Path(path))
+            for name, path in custom.items()
+        }
+
+    if isinstance(custom, (str, Path)):
+        # Single path — auto name from filename stem
+        path = Path(custom)
+        space_name = path.stem
+        return {space_name: ConfigParser.load_yaml(path)}
+
+    if isinstance(custom, list):
+        # List of paths — auto name from filename stems
+        result: dict[str, dict[str, Any]] = {}
+        for item in custom:
+            path = Path(item)
+            space_name = path.stem
+            if space_name in result:
+                raise ConfigError(
+                    f"Duplicate space name '{space_name}' derived from filenames. "
+                    f"Use a dict with explicit space names to disambiguate."
+                )
+            result[space_name] = ConfigParser.load_yaml(path)
+        return result
+
+    raise ConfigError(
+        f"Invalid custom config type: {type(custom).__name__}. "
+        f"Expected str, Path, list, or dict."
+    )
+
+
 def merge_raw_configs(
     primary: dict[str, Any],
-    custom: dict[str, Any],
+    custom_spaces: dict[str, dict[str, Any]],
 ) -> dict[str, Any]:
-    """Merge two raw YAML config dicts (before Pydantic parsing).
+    """Merge a primary config with multiple custom space configs.
 
-    The primary dict is the base. The custom dict overrides or extends it.
-    Returns a new dict — neither input is mutated.
+    Custom fields are tagged with their space name and appended (never override
+    primary fields). Field name overlap between primary and custom raises
+    ``ConfigError``. Non-field sections are merged sequentially across all
+    custom configs.
+
+    Args:
+        primary: Raw YAML dict for the primary config.
+        custom_spaces: Mapping of space_name → raw YAML dict for each custom config.
+            Pass an empty dict for no custom configs.
+
+    Returns:
+        A new merged dict — inputs are not mutated.
     """
-    # Warn on unknown sections in custom config
-    unknown = set(custom) - _KNOWN_SECTIONS
-    if unknown:
-        logger.warning("  [merge] custom config has unknown sections (ignored): %s", sorted(unknown))
+    # Warn on unknown sections in custom configs
+    for space_name, custom in custom_spaces.items():
+        unknown = set(custom) - _KNOWN_SECTIONS
+        if unknown:
+            logger.warning(
+                "  [merge] custom config '%s' has unknown sections (ignored): %s",
+                space_name, sorted(unknown),
+            )
 
     merged: dict[str, Any] = {}
 
-    # --- entity ---
-    merged["entity"] = _merge_dict(
-        primary.get("entity", {}),
-        custom.get("entity", {}),
-        section="entity",
-    )
+    # --- entity --- (custom can override entity metadata like version)
+    result_entity = dict(primary.get("entity", {}))
+    for custom in custom_spaces.values():
+        result_entity = _merge_dict(result_entity, custom.get("entity", {}), section="entity")
+    merged["entity"] = result_entity
 
-    # --- expression_packages ---
-    merged["expression_packages"] = _merge_dict(
-        primary.get("expression_packages", {}),
-        custom.get("expression_packages", {}),
-        section="expression_packages",
-    )
+    # --- dict-merge sections: expression_packages, parameters, connections ---
+    for section in ("expression_packages", "parameters", "connections"):
+        result_section = dict(primary.get(section, {}))
+        for custom in custom_spaces.values():
+            result_section = _merge_dict(result_section, custom.get(section, {}), section=section)
+        merged[section] = result_section
 
-    # --- parameters ---
-    merged["parameters"] = _merge_dict(
-        primary.get("parameters", {}),
-        custom.get("parameters", {}),
-        section="parameters",
-    )
+    # --- sources: merge by name across all custom configs ---
+    result_sources = list(primary.get("sources", []))
+    for custom in custom_spaces.values():
+        result_sources = _merge_by_key(result_sources, custom.get("sources", []), key="name", section="sources")
+    merged["sources"] = result_sources
 
-    # --- connections ---
-    merged["connections"] = _merge_dict(
-        primary.get("connections", {}),
-        custom.get("connections", {}),
-        section="connections",
-    )
+    # --- joins: merge by (left, right) ---
+    result_joins = list(primary.get("joins", []))
+    for custom in custom_spaces.values():
+        result_joins = _merge_by_key(
+            result_joins, custom.get("joins", []),
+            key=lambda j: (j.get("left", ""), j.get("right", "")),
+            section="joins",
+        )
+    merged["joins"] = result_joins
 
-    # --- sources ---
-    merged["sources"] = _merge_by_key(
-        primary.get("sources", []),
-        custom.get("sources", []),
-        key="name",
-        section="sources",
-    )
+    # --- append sections: pre_filters, post_filters, validations ---
+    for section in ("pre_filters", "post_filters", "validations"):
+        result_list = list(primary.get(section, []))
+        for custom in custom_spaces.values():
+            result_list = _merge_append(result_list, custom.get(section, []), section=section)
+        merged[section] = result_list
 
-    # --- joins ---
-    merged["joins"] = _merge_by_key(
-        primary.get("joins", []),
-        custom.get("joins", []),
-        key=lambda j: (j.get("left", ""), j.get("right", "")),
-        section="joins",
-    )
-
-    # --- pre_filters ---
-    merged["pre_filters"] = _merge_append(
-        primary.get("pre_filters", []),
-        custom.get("pre_filters", []),
-        section="pre_filters",
-    )
-
-    # --- post_filters ---
-    merged["post_filters"] = _merge_append(
-        primary.get("post_filters", []),
-        custom.get("post_filters", []),
-        section="post_filters",
-    )
-
-    # --- fields ---
-    merged["fields"] = _merge_by_key(
+    # --- fields: tag custom fields with space, validate no overlap ---
+    merged["fields"] = _merge_fields_with_spaces(
         primary.get("fields", []),
-        custom.get("fields", []),
-        key="name",
-        section="fields",
-    )
-
-    # --- validations ---
-    merged["validations"] = _merge_append(
-        primary.get("validations", []),
-        custom.get("validations", []),
-        section="validations",
+        {name: cfg.get("fields", []) for name, cfg in custom_spaces.items()},
     )
 
     return merged
+
+
+def _merge_fields_with_spaces(
+    primary_fields: list[dict[str, Any]],
+    custom_field_spaces: dict[str, list[dict[str, Any]]],
+) -> list[dict[str, Any]]:
+    """Merge primary fields with custom space fields.
+
+    Custom fields are tagged with ``space`` and appended. Raises ``ConfigError``
+    if any custom field name overlaps with a primary field name.
+
+    Same field names across different custom spaces are allowed — each space
+    is a separate layer. Transparent attribute access works for unique names;
+    ambiguous names require explicit ``entity.spaces["space"]["field"]`` access.
+    """
+    # Copy primary fields (no space tag = primary)
+    result = [dict(f) for f in primary_fields]
+    primary_names = {f.get("name") for f in primary_fields if "name" in f}
+
+    for space_name, fields in custom_field_spaces.items():
+        if not fields:
+            continue
+
+        added: list[str] = []
+        for field in fields:
+            field_name = field.get("name")
+            if not field_name:
+                continue
+
+            # Check overlap with primary fields
+            if field_name in primary_names:
+                raise ConfigError(
+                    f"Custom space '{space_name}': field '{field_name}' already exists "
+                    f"in the primary config. Use the primary field directly or choose "
+                    f"a different name for the custom field."
+                )
+
+            tagged = {**field, "space": space_name}
+            result.append(tagged)
+            added.append(field_name)
+
+        if added:
+            logger.info("  [merge] fields: space '%s' added: %s", space_name, added)
+
+    return result
 
 
 # ---------------------------------------------------------------------------

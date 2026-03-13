@@ -7,6 +7,7 @@ entity field mapping (which doubles as the dynamic class definition).
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any, Literal
 
 # Reusable type alias — kept in sync with ValidationConfig.type
@@ -239,10 +240,27 @@ class FieldConfig(BaseModel):
 
     name: str = Field(..., description="Field / column name")
     dtype: str = Field(..., description="Data type: str, int32, int64, float64, datetime, bool, nested")
+    space: str | None = Field(
+        None,
+        description=(
+            "Namespace for this field. None = primary space. "
+            "Set automatically by merge_configs for custom config fields. "
+            "Users should not set this directly in YAML."
+        ),
+    )
     description: str = Field("", description="Human-readable description")
     primary_key: bool = Field(False, description="Whether this is part of the primary key")
     entity_ref: str | None = Field(
         None, description="Reference to another entity config (for nested fields)"
+    )
+    entity_ref_config: str | None = Field(
+        None,
+        description=(
+            "Explicit filename for the sub-entity config (e.g. 'collateral_demo.yaml'). "
+            "Resolved relative to the parent config's directory. "
+            "When omitted, the pipeline searches by convention: "
+            "{snake_case(entity_ref)}.yaml or {snake_case(entity_ref)}_*.yaml."
+        ),
     )
 
     # --- Data origin (mutually exclusive) ---
@@ -465,6 +483,10 @@ class EntityConfig(BaseModel):
     )
     validations: list[ValidationConfig] | None = None
     fields: list[FieldConfig]
+
+    # Non-YAML metadata — set by ConfigParser.parse() or merge_configs()
+    # Used by the pipeline to resolve sub-entity config files
+    config_path: Path | None = Field(None, exclude=True)
 
     @model_validator(mode="after")
     def resolve_connection_refs(self) -> EntityConfig:

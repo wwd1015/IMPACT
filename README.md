@@ -410,6 +410,11 @@ fields:
                                 #   Must match entity.name in the sub-entity's YAML config.
                                 #   Each nested DataFrame cell is validated, transformed, and
                                 #   converted into a list of sub-entity dataclass instances.
+    entity_ref_config: "collateral_demo.yaml"
+                                # optional — explicit sub-entity config filename.
+                                #   Resolved relative to the parent config's directory.
+                                #   When omitted, searches by convention:
+                                #   {snake_case(entity_ref)}.yaml or {snake_case(entity_ref)}_*.yaml
     temp: false                 # optional, default false — if true, the field participates in
                                 #   processing and validation but is excluded from the entity class
     fill_na: "UNKNOWN"          # optional — scalar fill applied after cast; omit to skip
@@ -564,22 +569,145 @@ validations:
 
 ### Config Merge — Custom Overrides
 
-IMPACT provides standardized configs that define the primary data processing logic. Users can create custom override configs to add or replace specific sections without duplicating the entire config. The merge happens at the YAML level before parsing — the IMPACT config is always the primary base.
+IMPACT provides standardized configs that define the primary data processing logic. Users can create custom override configs to add new fields without duplicating the entire config. Custom fields occupy named **"spaces"** on the entity — isolated from primary fields. The merge happens at the YAML level before parsing.
+
+#### Quick Start
 
 ```python
-from impact.entity.config.merger import merge_configs
+from impact.entity.pipeline import EntityPipeline
 
-# IMPACT config is always the primary, regardless of argument order
-config = merge_configs(
-    primary="configs/facility_example.yaml",     # IMPACT standard config
-    custom="user_configs/facility_custom.yaml",  # user's sparse overrides
-)
+# Single custom config (space name auto-derived from filename stem)
+result = EntityPipeline(
+    config="configs/demo/facility_demo.yaml",
+    custom="configs/demo/custom_risk.yaml",       # space = "custom_risk"
+).run()
 
-# Use the merged config in the pipeline
-result = EntityPipeline(config=config).run()
+# Explicit space name via dict
+result = EntityPipeline(
+    config="configs/demo/facility_demo.yaml",
+    custom={"risk": "configs/demo/custom_risk.yaml"},  # space = "risk"
+).run()
+
+# Multiple custom configs with explicit space names
+result = EntityPipeline(
+    config="configs/demo/facility_demo.yaml",
+    custom={
+        "risk": "configs/demo/custom_risk.yaml",
+        "reporting": "configs/demo/custom_reporting.yaml",
+    },
+).run()
+
+# Custom overrides for sub-entities too
+result = EntityPipeline(
+    config="configs/demo/facility_demo.yaml",
+    custom={"risk": "configs/demo/custom_risk.yaml"},
+    sub_entity_custom={
+        "Collateral": {"risk": "configs/demo/collateral_risk.yaml"},
+    },
+).run()
 ```
 
-**Merge semantics by section:**
+The pipeline handles `merge_configs` internally — no need to call it separately.
+
+> **Advanced:** You can still call `merge_configs()` directly for programmatic use cases:
+> ```python
+> from impact.entity.config.merger import merge_configs
+> config = merge_configs(primary="configs/facility.yaml", custom="configs/custom.yaml")
+> result = EntityPipeline(config=config).run()  # config carries config_path automatically
+> ```
+
+#### Entity Structure with Custom Spaces
+
+Custom fields are **not** mixed into the primary entity class. They are stored in a `spaces` dict on the entity, keeping them separate from primary fields. The entity is still a real `dataclass`.
+
+```
+┌───────────────────────────────────────────────────────────┐
+│ Facility (dataclass)                                      │
+│                                                           │
+│   .facility_id = "FAC-001"   ─┐                           │
+│   .commitment_amount = 1M     │ direct attributes         │
+│   .utilization_rate = 0.75    │ (primary config fields)    │
+│   .collateral_items = [...]  ─┘                           │
+│                                                           │
+│   .spaces = {                                             │
+│     "risk": {                    ← plain dict, NOT a      │
+│         "risk_score": 0.85,       dataclass — clearly     │
+│         "risk_grade": "HIGH",     distinct from sub-      │
+│         "risk_weighted_amount":   entities like Collateral │
+│             850000.0,                                     │
+│     },                                                    │
+│     "reporting": {                                        │
+│         "report_flag": True,                              │
+│         "report_category": "LARGE",                       │
+│     },                                                    │
+│   }                                                       │
+│                                                           │
+│   # Sub-entities are clearly different — nested lists     │
+│   # of real entity instances, not flat dicts:             │
+│   .collateral_items = [                                   │
+│       Collateral(type="Real Estate", value=500000.0),     │
+│       Collateral(type="Equipment", value=120000.0),       │
+│   ]                                                       │
+└───────────────────────────────────────────────────────────┘
+```
+
+**Key distinction:** Spaces are flat dicts of extra fields on the **same** entity. Sub-entities are lists of **separate** entity instances with their own identity and primary keys.
+
+#### Accessing Space Fields
+
+```python
+entity = result.entities[0]
+
+# Primary fields — direct attribute access (always works)
+entity.facility_id              # "FAC-001"
+entity.commitment_amount        # 1000000.0
+
+# Space fields — transparent access for UNIQUE names
+entity.risk_score               # 0.85 (only in "risk" space → works)
+entity.report_flag              # True  (only in "reporting" space → works)
+
+# Space fields — explicit access (always works, required for ambiguous names)
+entity.spaces["risk"]["risk_score"]           # 0.85
+entity.spaces["reporting"]["report_flag"]     # True
+
+# Qualified getitem — space_name.field_name
+entity["risk.risk_score"]       # 0.85
+
+# Same field name in multiple spaces? Transparent access raises an error:
+#   entity.score → AttributeError: 'score' exists in multiple spaces:
+#                  ['risk', 'reporting']. Use entity.spaces["<space>"]["score"]
+# Use explicit access instead:
+entity.spaces["risk"]["score"]
+entity.spaces["reporting"]["score"]
+```
+
+#### Space Management Methods
+
+All return **new copies** — the original entity is never mutated.
+
+```python
+# Get entity with only primary fields (no spaces)
+primary = entity.primary_only()
+primary.facility_id         # works
+primary.risk_score          # AttributeError — no spaces
+hasattr(primary, "spaces")  # False
+
+# Remove one space
+reduced = entity.drop_space("reporting")
+reduced.risk_score          # works (risk space still present)
+reduced.report_flag         # AttributeError (reporting dropped)
+entity.report_flag          # True (original unchanged)
+
+# Keep only one space
+risk_only = entity.select_space("risk")
+risk_only.risk_score        # works
+risk_only.report_flag       # AttributeError
+
+# Flat dict of all fields (primary + all spaces)
+entity.to_dict()            # {"facility_id": "FAC-001", ..., "risk_score": 0.85, ...}
+```
+
+#### Merge Semantics
 
 | Section | Strategy | Example |
 |---|---|---|
@@ -588,65 +716,49 @@ result = EntityPipeline(config=config).run()
 | `parameters` | Dict merge, custom wins on conflict | Override `active_product` while keeping `snapshot_date` |
 | `sources` | Merge by `name`; same name = replace entirely; new = added | Swap a Snowflake source for CSV in dev |
 | `joins` | Merge by `(left, right)` pair; same pair = replace; new = added | Change join type or add new joins |
-| `pre_filters` | Custom pre_filters appended to primary's | Add early data reduction gates |
-| `post_filters` | Custom post_filters appended to primary's | Add stricter post-processing gates |
-| `fields` | Merge by `name`; same name = replace entirely; new = added | Override a field's dtype, source, or validation |
-| `validations` | Custom validations appended to primary's | Add extra validation rules |
+| `pre_filters` | Custom entries appended to primary's | Add early data reduction gates |
+| `post_filters` | Custom entries appended to primary's | Add stricter post-processing gates |
+| `fields` | Custom fields tagged with space and appended; **overlap with primary raises error**; same name across different spaces is allowed | Add `risk_score` to "risk" space |
+| `validations` | Custom entries appended to primary's | Add extra validation rules |
 | `connections` | Dict merge, custom wins on conflict | Override or add named connections |
 
-**Example custom config** — only includes what's different:
+#### Example Custom Config
+
+Only includes what's different from the primary config:
 
 ```yaml
-# user_configs/facility_custom.yaml
-# Sparse override — only the sections/fields you want to change
+# configs/demo/custom_risk.yaml
 
 parameters:
-  active_product: "REVOLVER"          # override default TERM_LOAN
-
-sources:
-  - name: collateral                   # replaces the primary's 'collateral' source
-    type: csv
-    path: "./data/collateral_local.csv" # use local CSV instead of Parquet
+  risk_threshold: 0.5
 
 fields:
-  # Override: change the commitment_amount validation to be stricter
-  - name: commitment_amount
-    source: commitment_amount
+  - name: risk_score
+    derived: "lambda row: min(row['utilization_rate'] * 1.2, 1.0)"
     dtype: float64
-    validation_type: [not_null, range]
+    validation_type: [range]
     validation_rule:
-      range: (0, null]                  # exclusive lower bound (must be > 0)
-    validation_severity:
-      not_null: error
-      range: error                      # upgrade from warning to error
+      range: [0.0, 1.0]
 
-  # Addition: new field not in the primary config
-  - name: region
-    source: region_code
+  - name: risk_grade
+    derived: "lambda row: 'HIGH' if row['risk_score'] > @risk_threshold else 'LOW'"
     dtype: str
-    fill_na: "UNKNOWN"
 
-post_filters:
-  - "region != 'EXCLUDED'"             # appended to primary's post_filters
+  - name: risk_weighted_amount
+    derived: "commitment_amount * risk_score"
+    dtype: float64
 ```
 
-**Merge logging** — the merger logs every adjustment so users can verify the effect:
+#### Design Principles
 
-```
-INFO | [merge] parameters: overridden: ['active_product']
-INFO | [merge] sources: overridden: ['collateral']
-INFO | [merge] fields: overridden: ['commitment_amount']
-INFO | [merge] fields: added: ['region']
-INFO | [merge] post_filters: appended 1 custom entries
-```
+- The IMPACT config is **always** the primary base
+- Custom configs are **sparse** — only include what you want to add or change
+- **Field isolation** — custom fields live in named spaces (`entity.spaces["risk"]`), never contaminate primary fields. Drop a space to get a pure primary entity
+- **No field override** — custom field names must not overlap with primary field names (raises `ConfigError`). Use the primary field directly or choose a new name
+- **Same name across spaces** — allowed. Two spaces can both define `score`. Transparent access (`entity.score`) raises an error pointing users to explicit access. This keeps single-space usage simple while supporting multi-space scenarios
+- **dataclass identity** — the entity is always a real `dataclass` (`dataclasses.is_dataclass(entity)` is `True`), unlike sub-entities which are separate entity instances
 
-**Key design principles:**
-
-- The IMPACT config is **always** the primary base — argument order doesn't matter
-- Custom configs are **sparse** — only include what you want to change
-- **Fields replaced entirely** — if you override a field, the custom definition replaces the primary's completely (including its validations). This avoids ambiguity about which validations apply
-- **No removal** — the custom config can only override or add, not remove sections from the primary
-
+**Demo files:** `configs/demo/custom_risk.yaml`, `configs/demo/custom_reporting.yaml`
 **Key file:** `src/impact/entity/config/merger.py`
 
 ---
@@ -744,7 +856,7 @@ EntityPipeline.run(parameters)
 │
 ├── Stage 4b — Sub-entity processing
 │       For each nested field with entity_ref:
-│         Resolve sub-entity config (convention-based file lookup)
+│         Resolve sub-entity config (entity_ref_config or convention-based lookup)
 │         Process each cell's DataFrame through SubEntityProcessor
 │           (copy → cast → fill_na → validate → derived → build)
 │         Replace nested DataFrame cells with list[SubEntity]
@@ -814,7 +926,19 @@ facility.collateral_items[0].collateral_value  # → 500000.0
 result.sub_entity_classes          # → {"collateral_items": <class 'Collateral'>}
 ```
 
-**Config file naming convention:**
+**Config file resolution:**
+
+**Option 1 — Explicit filename** (recommended when multiple matching files exist):
+
+```yaml
+- name: collateral_items
+  source: collateral_items
+  dtype: nested
+  entity_ref: Collateral
+  entity_ref_config: "collateral_demo.yaml"    # exact file, no ambiguity
+```
+
+**Option 2 — Convention-based** (default when `entity_ref_config` is omitted):
 
 For `entity_ref: Collateral`, the pipeline searches in the parent config's directory:
 1. `collateral.yaml` (exact match)
@@ -825,6 +949,8 @@ For multi-word names like `FinancialStatement`, it also tries the plain lowercas
 2. `financial_statement_*.yaml`
 3. `financialstatement.yaml`
 4. `financialstatement_*.yaml`
+
+If multiple files match, the first one alphabetically is chosen. Use `entity_ref_config` to avoid ambiguity.
 
 **Recursive sub-entities** — sub-entity configs can themselves contain `entity_ref` fields, enabling multi-level nesting. For example, the obligor pipeline produces:
 
@@ -838,6 +964,18 @@ Obligor
     └── collateral_items: list[Collateral]
         ├── collateral_type, collateral_value
         └── value_bucket (derived)
+```
+
+**Custom overrides for sub-entities** — use `sub_entity_custom` on the pipeline to merge custom configs into sub-entity configs at runtime. Keyed by `entity_ref` name:
+
+```python
+result = EntityPipeline(
+    config="configs/demo/obligor_demo.yaml",
+    sub_entity_custom={
+        "Facility": {"risk": "configs/demo/facility_risk.yaml"},
+        "Collateral": "configs/demo/collateral_custom.yaml",
+    },
+).run()
 ```
 
 **Reusing top-level configs as sub-entity configs** — a config with `sources` defined (like `facility_example.yaml`) can be used as a sub-entity config. The `SubEntityProcessor` ignores the `sources`, `joins`, and `filters` sections but uses the source names for prefix stripping (e.g. `source: rating_overrides.rating_override` → `rating_override`). This means a single config file defines both the standalone pipeline and the sub-entity schema.

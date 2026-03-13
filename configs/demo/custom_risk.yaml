@@ -1,0 +1,41 @@
+# ---------------------------------------------------------------------------
+# Custom Risk Config — custom override for facility_demo.yaml
+#
+# This config adds risk-related fields to the Facility entity in a separate
+# "risk" space. Fields here are isolated from primary config fields.
+#
+# Usage:
+#   from impact.entity.config.merger import merge_configs
+#   from impact.entity.pipeline import EntityPipeline
+#
+#   config = merge_configs(
+#       primary="configs/demo/facility_demo.yaml",
+#       custom={"risk": "configs/demo/custom_risk.yaml"},
+#   )
+#   result = EntityPipeline(config=config).run()
+#
+#   entity = result.entities[0]
+#   entity.facility_id            # primary field — direct attribute
+#   entity.risk_score             # space field — transparent (unique name)
+#   entity.spaces["risk"]         # all risk fields as a dict
+#   entity.primary_only()         # Facility without any custom spaces
+# ---------------------------------------------------------------------------
+
+parameters:
+  risk_threshold: 0.5
+
+fields:
+  - name: risk_score
+    derived: "lambda row: min(row['utilization_rate'] * 1.2, 1.0)"
+    dtype: float64
+    validation_type: [range]
+    validation_rule:
+      range: [0.0, 1.0]
+
+  - name: risk_grade
+    derived: "lambda row: 'HIGH' if row['risk_score'] > @risk_threshold else 'LOW'"
+    dtype: str
+
+  - name: risk_weighted_amount
+    derived: "commitment_amount * risk_score"
+    dtype: float64

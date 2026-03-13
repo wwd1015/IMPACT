@@ -23,6 +23,7 @@ from impact.common.utils import (
     format_lambda_diagnostic,
     strip_source_prefixes,
 )
+from impact.entity.config.merger import merge_configs
 from impact.entity.config.parser import ConfigParser
 from impact.entity.config.schema import EntityConfig, FieldConfig
 from impact.entity.model.builder import EntityBuilder
@@ -58,6 +59,7 @@ class SubEntityProcessor:
     def __init__(
         self, config: EntityConfig, config_path: Path | None = None,
         expression_namespace: dict[str, Any] | None = None,
+        sub_entity_custom: dict[str, Any] | None = None,
     ):
         self.config = config
         self.config_path = config_path
@@ -66,6 +68,7 @@ class SubEntityProcessor:
         self._expression_namespace = expression_namespace or build_expression_namespace(
             config.expression_packages
         )
+        self._sub_entity_custom = sub_entity_custom or {}
 
     def process(self, df: pd.DataFrame) -> SubEntityResult:
         """Process a nested DataFrame through the sub-entity pipeline.
@@ -122,6 +125,7 @@ class SubEntityProcessor:
         sub_entity_classes = process_sub_entity_fields(
             available_fields, result, report, self.config_path,
             expression_namespace=self._expression_namespace,
+            sub_entity_custom=self._sub_entity_custom,
         )
 
         # Build entity class and instances
@@ -288,6 +292,7 @@ def process_sub_entity_fields(
     config_path: Path | None,
     parent_context: str = "",
     expression_namespace: dict[str, Any] | None = None,
+    sub_entity_custom: dict[str, Any] | None = None,
 ) -> dict[str, type]:
     """Process nested fields with entity_ref through sub-entity pipelines.
 
@@ -302,10 +307,14 @@ def process_sub_entity_fields(
         config_path: Path to the parent config file (for sub-entity resolution).
         parent_context: Optional context prefix from a higher-level parent.
         expression_namespace: Pre-built package namespace from the parent pipeline.
+        sub_entity_custom: Custom override configs for sub-entities, keyed by
+            ``entity_ref`` name. Each value uses the same format as
+            ``merge_configs(custom=...)``.
 
     Returns:
         Mapping of field name → sub-entity class.
     """
+    sub_entity_custom = sub_entity_custom or {}
     sub_entity_classes: dict[str, type] = {}
     nested_fields = [
         f for f in fields
@@ -319,10 +328,15 @@ def process_sub_entity_fields(
 
     for field in nested_fields:
         logger.info("  Processing sub-entity '%s' for field '%s'", field.entity_ref, field.name)
-        sub_config = resolve_sub_entity_config(field.entity_ref, config_path)
+        sub_config = resolve_sub_entity_config(
+            field.entity_ref, config_path,
+            entity_ref_config=field.entity_ref_config,
+            custom=sub_entity_custom.get(field.entity_ref),
+        )
         processor = SubEntityProcessor(
             sub_config, config_path=config_path,
             expression_namespace=expression_namespace,
+            sub_entity_custom=sub_entity_custom,
         )
 
         entity_lists: list[list] = []
@@ -380,18 +394,27 @@ def _build_row_context(
 
 
 def resolve_sub_entity_config(
-    entity_ref: str, parent_config_path: Path | None
+    entity_ref: str,
+    parent_config_path: Path | None,
+    entity_ref_config: str | None = None,
+    custom: str | Path | list[str | Path] | dict[str, str | Path] | None = None,
 ) -> EntityConfig:
     """Resolve and parse a sub-entity config by entity_ref name.
 
-    Searches the parent config's directory for any YAML file matching
-    ``{snake_case(entity_ref)}_*.yaml`` or ``{snake_case(entity_ref)}.yaml``.
-    For example, ``entity_ref: Collateral`` matches ``collateral_demo.yaml``,
-    ``collateral_example.yaml``, ``collateral.yaml``, etc.
+    When ``entity_ref_config`` is provided, uses that exact filename (resolved
+    relative to the parent config's directory).  Otherwise, searches by
+    convention for ``{snake_case(entity_ref)}.yaml`` or
+    ``{snake_case(entity_ref)}_*.yaml``.
+
+    When ``custom`` is provided, the resolved primary sub-entity config is
+    merged with the custom override(s) via ``merge_configs``.
 
     Args:
         entity_ref: The entity_ref value (e.g. ``"Collateral"``).
         parent_config_path: Path to the parent YAML config file.
+        entity_ref_config: Optional explicit filename for the sub-entity config.
+        custom: Optional custom override config(s) for this sub-entity.
+            Same format as ``merge_configs(custom=...)``.
 
     Returns:
         Parsed EntityConfig for the sub-entity.
@@ -404,30 +427,47 @@ def resolve_sub_entity_config(
     if parent_config_path is None:
         raise ConfigError(
             f"Cannot resolve sub-entity '{entity_ref}': no parent config path. "
-            "Use config_path= when creating the pipeline, or set entity_ref_path on the field."
+            "Pass a config_path when creating the pipeline."
         )
 
     config_dir = parent_config_path.parent
-    snake_name = _camel_to_snake(entity_ref)
-    lower_name = entity_ref.lower()
 
-    # Collect candidate files: exact match first, then glob
-    prefixes = sorted({snake_name, lower_name})  # deduplicate if same
-    candidate_paths: list[Path] = []
-    for prefix in prefixes:
-        exact = config_dir / f"{prefix}.yaml"
-        if exact.exists():
-            candidate_paths.append(exact)
-        candidate_paths.extend(sorted(config_dir.glob(f"{prefix}_*.yaml")))
+    # Explicit filename takes priority
+    if entity_ref_config is not None:
+        chosen = config_dir / entity_ref_config
+        if not chosen.exists():
+            raise ConfigError(
+                f"Sub-entity config for '{entity_ref}': explicit file "
+                f"'{entity_ref_config}' not found in {config_dir}."
+            )
+    else:
+        # Convention-based search
+        snake_name = _camel_to_snake(entity_ref)
+        lower_name = entity_ref.lower()
 
-    if not candidate_paths:
-        raise ConfigError(
-            f"Sub-entity config for '{entity_ref}' not found in {config_dir}. "
-            f"Expected a file matching '{snake_name}.yaml' or '{snake_name}_*.yaml'."
-        )
+        prefixes = sorted({snake_name, lower_name})  # deduplicate if same
+        candidate_paths: list[Path] = []
+        for prefix in prefixes:
+            exact = config_dir / f"{prefix}.yaml"
+            if exact.exists():
+                candidate_paths.append(exact)
+            candidate_paths.extend(sorted(config_dir.glob(f"{prefix}_*.yaml")))
 
-    chosen = candidate_paths[0]
-    logger.info("Resolved sub-entity '%s' config: %s", entity_ref, chosen)
+        if not candidate_paths:
+            raise ConfigError(
+                f"Sub-entity config for '{entity_ref}' not found in {config_dir}. "
+                f"Expected a file matching '{snake_name}.yaml' or '{snake_name}_*.yaml', "
+                f"or set entity_ref_config on the field."
+            )
+        chosen = candidate_paths[0]
+
+    # Merge with custom overrides if provided
+    if custom is not None:
+        logger.info("Resolved sub-entity '%s' config (merged): %s + custom", entity_ref, chosen)
+        return merge_configs(primary=chosen, custom=custom)
+
+    method = "explicit" if entity_ref_config else "convention"
+    logger.info("Resolved sub-entity '%s' config (%s): %s", entity_ref, method, chosen)
     return ConfigParser().parse(chosen)
 
 
