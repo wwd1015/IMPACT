@@ -7,13 +7,14 @@ entity field mapping (which doubles as the dynamic class definition).
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from typing import Any, Literal
 
 # Reusable type alias — kept in sync with ValidationConfig.type
 ValidationTypeLiteral = Literal["not_null", "unique", "range", "expression", "custom"]
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 # ---------------------------------------------------------------------------
@@ -209,6 +210,35 @@ class ValidationConfig(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# Derived function reference — alternative to inline expression strings
+# ---------------------------------------------------------------------------
+class DerivedFunctionRef(BaseModel):
+    """Reference to a Python function for derived field computation.
+
+    Use this instead of inline expressions for complex logic that benefits
+    from IDE support (syntax highlighting, breakpoints, type checking).
+
+    The function receives a single ``row`` (pd.Series) and returns a scalar::
+
+        def compute_risk_score(row, threshold=0.5):
+            base = row["utilization_rate"] * 0.6
+            return base if base > threshold else 0.0
+
+    YAML usage::
+
+        - name: risk_score
+          derived:
+            function: "myproject.expressions.compute_risk_score"
+            kwargs:
+              threshold: 0.5
+          dtype: float64
+    """
+
+    function: str = Field(..., description="Dotted import path: 'module.path.function_name'")
+    kwargs: dict[str, Any] = Field(default_factory=dict, description="Keyword arguments passed to the function")
+
+
+# ---------------------------------------------------------------------------
 # Field configs (= entity class definition + inline transforms + validations)
 # ---------------------------------------------------------------------------
 class FieldConfig(BaseModel):
@@ -273,13 +303,14 @@ class FieldConfig(BaseModel):
             "    source-name prefixes are stripped automatically before evaluation."
         ),
     )
-    derived: str | None = Field(
+    derived: str | DerivedFunctionRef | None = Field(
         None,
         description=(
             "Processed in Pass 2, after all source fields are fully processed "
             "(renamed, cast, filled, validated). Use field names only — no src_name prefix.\n"
             "  pandas expression: 'col_a / col_b'\n"
-            "  row-wise lambda:   'lambda row: row[\"a\"] * 2'"
+            "  row-wise lambda:   'lambda row: row[\"a\"] * 2'\n"
+            "  function ref:      {function: 'pkg.module.func', kwargs: {key: val}}"
         ),
     )
 
@@ -331,7 +362,40 @@ class FieldConfig(BaseModel):
             raise ValueError(
                 f"Field '{self.name}': exactly one of 'source' or 'derived' is required."
             )
+        # Validate expression syntax at parse time (catch mismatched parens, bad syntax early)
+        self._validate_expression_syntax()
         return self
+
+    def _validate_expression_syntax(self) -> None:
+        """Compile expressions to catch syntax errors before any data is touched."""
+        # Source expressions (non-identifier strings are eval expressions)
+        if isinstance(self.source, str):
+            stripped = self.source.strip()
+            if not stripped.isidentifier() and "." in stripped or " " in stripped:
+                # Likely an expression, not a plain column name — try compiling
+                self._try_compile(stripped, "source")
+
+        # Derived expressions (strings only — DerivedFunctionRef is validated separately)
+        if isinstance(self.derived, str):
+            expr = self.derived.strip()
+            self._try_compile(expr, "derived")
+
+    def _try_compile(self, expr: str, origin: str) -> None:
+        """Try to compile an expression string, raising ValueError on syntax error.
+
+        Normalizes ``@param`` references (pandas eval syntax) to bare names
+        before compiling, since ``@`` is not valid Python syntax.
+        """
+        # Strip @param → param so compile() doesn't choke on pandas eval syntax
+        normalized = re.sub(r"@(\w+)", r"\1", expr)
+        try:
+            compile(normalized, f"<field:{self.name}:{origin}>", "eval")
+        except SyntaxError as e:
+            raise ValueError(
+                f"Field '{self.name}': syntax error in {origin} expression: "
+                f"{e.msg} (line {e.lineno}, col {e.offset})\n"
+                f"  Expression: {expr!r}"
+            ) from None
 
     def build_validation_configs(self, pass_filter: str | None = None) -> list[ValidationConfig]:
         """Expand compact field-level validation syntax into ValidationConfig objects.

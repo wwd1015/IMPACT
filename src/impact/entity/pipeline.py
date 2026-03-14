@@ -14,19 +14,20 @@ from typing import Any, Literal
 
 import pandas as pd
 
-from impact.common.exceptions import ConfigError, SourceError, TransformError, ValidationError
+from impact.common.exceptions import ConfigError, DebugContext, SourceError, TransformError, ValidationError
 from impact.common.logging import get_logger
 from impact.common.utils import (
     build_expression_namespace,
     cast_and_fill,
     enhance_expression_error,
+    import_dotted_path,
     normalize_lambda_at_params,
     format_lambda_diagnostic,
     strip_source_prefixes,
 )
 from impact.entity.config.merger import merge_configs
 from impact.entity.config.parser import ConfigParser
-from impact.entity.config.schema import EntityConfig, SnowflakeConnectionConfig
+from impact.entity.config.schema import DerivedFunctionRef, EntityConfig, SnowflakeConnectionConfig
 from impact.entity.join.engine import JoinEngine
 from impact.entity.model.builder import EntityBuilder
 from impact.entity.sub_entity import process_sub_entity_fields
@@ -45,6 +46,22 @@ from impact.entity.source.registry import ConnectorRegistry
 from impact.entity.validate.registry import ValidatorRegistry
 
 logger = get_logger(__name__)
+
+# Stage names used in DebugContext.stage and snapshot keys
+STAGE_SOURCE_FIELDS = "source_fields"
+STAGE_DERIVED_FIELDS = "derived_fields"
+STAGE_PRE_FILTERS = "pre_filters"
+STAGE_POST_FILTERS = "post_filters"
+STAGE_SOURCE_VALIDATION = "source_validation"
+STAGE_VALIDATION = "validation"
+
+SNAP_AFTER_JOIN = "after_join"
+SNAP_AFTER_PRE_FILTERS = "after_pre_filters"
+SNAP_AFTER_SOURCE_FIELDS = "after_source_fields"
+SNAP_AFTER_DERIVED_FIELDS = "after_derived_fields"
+SNAP_AFTER_POST_FILTERS = "after_post_filters"
+SNAP_AFTER_VALIDATION = "after_validation"
+SNAP_FINAL = "final"
 
 
 @dataclass
@@ -65,6 +82,7 @@ class PipelineResult:
     validation_report: ValidationReport
     metadata: dict[str, Any]
     sub_entity_classes: dict[str, type] = dataclasses.field(default_factory=dict)
+    snapshots: dict[str, pd.DataFrame] = dataclasses.field(default_factory=dict)
 
 
 class EntityPipeline:
@@ -145,13 +163,156 @@ class EntityPipeline:
         self._caster = CastTransformer()
         self._expression_namespace = build_expression_namespace(self.config.expression_packages)
 
-    def run(self, parameters: dict[str, Any] | None = None) -> PipelineResult:
+    def explain(self) -> str:
+        """Show the execution plan without loading any data.
+
+        Returns a formatted string describing every stage the pipeline will
+        execute based on the current config: sources, joins, filters, fields
+        (source vs derived), validations, and sub-entities.
+
+        Usage::
+
+            pipeline = EntityPipeline("configs/facility.yaml")
+            print(pipeline.explain())
+        """
+        lines: list[str] = []
+        cfg = self.config
+        lines.append(f"Entity: {cfg.entity.name} (v{cfg.entity.version})")
+        if cfg.entity.description:
+            lines.append(f"  {cfg.entity.description}")
+        lines.append("")
+
+        # Parameters
+        if cfg.parameters:
+            lines.append("Parameters:")
+            for k, v in cfg.parameters.items():
+                lines.append(f"  {k}: {v!r}")
+            lines.append("")
+
+        # Sources
+        lines.append(f"Sources ({len(cfg.sources)}):")
+        for s in cfg.sources:
+            tag = " [PRIMARY]" if s.primary else ""
+            lines.append(f"  {s.name} ({s.type}){tag}")
+        lines.append("")
+
+        # Joins
+        if cfg.joins:
+            lines.append(f"Joins ({len(cfg.joins)}):")
+            for j in cfg.joins:
+                keys = []
+                for cond in j.on:
+                    if cond.condition:
+                        keys.append(f"expr: {cond.condition}")
+                    else:
+                        keys.append(f"{cond.left_col} = {cond.right_col}")
+                lines.append(f"  {j.left} ↔ {j.right} ({j.how}, {j.relationship})")
+                for k in keys:
+                    lines.append(f"    on: {k}")
+            lines.append("")
+
+        # Pre-filters
+        if cfg.pre_filters:
+            lines.append(f"Pre-filters ({len(cfg.pre_filters)}):")
+            for f in cfg.pre_filters:
+                lines.append(f"  {f}")
+            lines.append("")
+
+        # Fields
+        source_fields = [f for f in cfg.fields if f.source is not None]
+        derived_fields = [f for f in cfg.fields if f.derived is not None]
+        temp_fields = [f for f in cfg.fields if f.temp]
+        pk_fields = [f for f in cfg.fields if f.primary_key]
+        nested_fields = [f for f in cfg.fields if f.entity_ref]
+
+        lines.append(f"Fields ({len(cfg.fields)}):")
+        lines.append(f"  Pass 1 — source fields ({len(source_fields)}):")
+        for f in source_fields:
+            extras = []
+            if f.primary_key:
+                extras.append("PK")
+            if f.temp:
+                extras.append("temp")
+            if f.fill_na is not None:
+                extras.append(f"fill_na={f.fill_na!r}")
+            tag = f" [{', '.join(extras)}]" if extras else ""
+            lines.append(f"    {f.name} ({f.dtype}): {f.source}{tag}")
+
+        lines.append(f"  Pass 2 — derived fields ({len(derived_fields)}):")
+        for f in derived_fields:
+            extras = []
+            if f.temp:
+                extras.append("temp")
+            if f.fill_na is not None:
+                extras.append(f"fill_na={f.fill_na!r}")
+            tag = f" [{', '.join(extras)}]" if extras else ""
+            if isinstance(f.derived, DerivedFunctionRef):
+                origin = f"fn:{f.derived.function}"
+                if f.derived.kwargs:
+                    origin += f" kwargs={f.derived.kwargs}"
+            else:
+                origin = f.derived
+            lines.append(f"    {f.name} ({f.dtype}): {origin}{tag}")
+        lines.append("")
+
+        # Post-filters
+        if cfg.post_filters:
+            lines.append(f"Post-filters ({len(cfg.post_filters)}):")
+            for f in cfg.post_filters:
+                lines.append(f"  {f}")
+            lines.append("")
+
+        # Validations
+        val_count = sum(len(f.validation_type or []) for f in cfg.fields)
+        global_count = len(cfg.validations or [])
+        if val_count or global_count:
+            lines.append(f"Validations ({val_count} field-level, {global_count} global):")
+            for f in cfg.fields:
+                for v in (f.validation_type or []):
+                    sev = (f.validation_severity or {}).get(v, "warning")
+                    lines.append(f"  {f.name}: {v} (severity={sev})")
+            for v in (cfg.validations or []):
+                lines.append(f"  [global] {v.type} (severity={v.severity})")
+            lines.append("")
+
+        # Sub-entities
+        if nested_fields:
+            lines.append(f"Sub-entities ({len(nested_fields)}):")
+            for f in nested_fields:
+                ref_cfg = f.entity_ref_config or "(auto-resolved)"
+                lines.append(f"  {f.name} → {f.entity_ref} (config: {ref_cfg})")
+            lines.append("")
+
+        # Summary
+        lines.append("Execution order:")
+        steps = ["Load sources"]
+        if cfg.joins:
+            steps.append("Execute joins")
+        if cfg.pre_filters:
+            steps.append("Apply pre-filters")
+        steps.append(f"Pass 1: {len(source_fields)} source fields")
+        steps.append("Validate source fields")
+        steps.append(f"Pass 2: {len(derived_fields)} derived fields")
+        if cfg.post_filters:
+            steps.append("Apply post-filters")
+        steps.append("Validate derived + global")
+        if nested_fields:
+            steps.append(f"Process {len(nested_fields)} sub-entities")
+        steps.append(f"Build {cfg.entity.name} class ({len(cfg.fields) - len(temp_fields)} fields)")
+        for i, step in enumerate(steps, 1):
+            lines.append(f"  {i}. {step}")
+
+        return "\n".join(lines)
+
+    def run(self, parameters: dict[str, Any] | None = None, debug: bool = False) -> PipelineResult:
         """Execute the full pipeline.
 
         Args:
             parameters: Runtime parameters injected by the orchestrator. Merged with
                 the config's global ``parameters`` block using the priority:
                 runtime > source-level > global config default.
+            debug: When ``True``, saves DataFrame snapshots at each stage boundary
+                on ``result.snapshots`` and attaches ``DebugContext`` to any exception.
 
         Returns:
             PipelineResult containing entity class, instances, DataFrame, and report.
@@ -159,13 +320,37 @@ class EntityPipeline:
         Raises:
             SourceError: If data loading fails.
             JoinError: If joining fails.
-            TransformError: If a transformation fails.
-            ValidationError: If validation fails with severity=error.
+            TransformError: If a transformation fails (has ``.debug_context`` when debug=True).
+            ValidationError: If validation fails with severity=error (has ``.debug_context`` when debug=True).
         """
         entity_name = self.config.entity.name
         logger.info("=" * 60)
         logger.info("Starting pipeline for entity: %s", entity_name)
         logger.info("=" * 60)
+
+        snapshots: dict[str, pd.DataFrame] = {}
+
+        def _snap(key: str, df: pd.DataFrame) -> None:
+            """Save a DataFrame snapshot if debug mode is active."""
+            if debug:
+                snapshots[key] = df.copy()
+
+        def _attach_debug(
+            exc: TransformError | ValidationError,
+            stage: str,
+            df: pd.DataFrame,
+        ) -> None:
+            """Attach DebugContext to an exception if debug mode is active."""
+            if not debug:
+                return
+            field = getattr(exc, "field", None)
+            exc.debug_context = DebugContext(
+                dataframe=df.copy(),
+                field=field,
+                expression=self._get_field_expression(field) if field else None,
+                parameters=effective_params,
+                stage=stage,
+            )
 
         # Resolve effective parameters: global config defaults → runtime overrides
         runtime_params = parameters or {}
@@ -179,11 +364,17 @@ class EntityPipeline:
         # 2. Identify primary and execute joins
         logger.info("Stage 2/5: Executing joins")
         result_df = self._execute_joins(frames)
+        _snap(SNAP_AFTER_JOIN, result_df)
 
         # 2b. Pre-filters — reduce dataset before field processing
         if self.config.pre_filters:
             logger.info("Applying pre-filters (before field processing)")
-            result_df = self._apply_filters(result_df, effective_params, self.config.pre_filters)
+            try:
+                result_df = self._apply_filters(result_df, effective_params, self.config.pre_filters)
+            except TransformError as exc:
+                _attach_debug(exc, STAGE_PRE_FILTERS, result_df)
+                raise
+            _snap(SNAP_AFTER_PRE_FILTERS, result_df)
 
         # 3. Field transforms — two ordered passes
         logger.info("Stage 3/5: Applying transformations")
@@ -193,7 +384,12 @@ class EntityPipeline:
         space_masks: dict[str, pd.Series] = {}
 
         # Pass 1: source fields (rename/expr → cast → fill_na)
-        result_df = self._apply_source_fields(result_df, effective_params, space_masks)
+        try:
+            result_df = self._apply_source_fields(result_df, effective_params, space_masks)
+        except TransformError as exc:
+            _attach_debug(exc, STAGE_SOURCE_FIELDS, result_df)
+            raise
+        _snap(SNAP_AFTER_SOURCE_FIELDS, result_df)
 
         # Compute selector masks after source fields are ready (selectors may reference them)
         if space_selectors:
@@ -205,12 +401,25 @@ class EntityPipeline:
         report = self._run_field_validations(result_df, pass_filter="source", space_masks=space_masks)
         if report.has_errors:
             logger.error("Source field validation failed with %d errors", report.error_count)
-            raise ValidationError(report=report, message=report.format_detail())
+            exc = ValidationError(report=report, message=report.format_detail())
+            _attach_debug(exc, STAGE_SOURCE_VALIDATION, result_df)
+            raise exc
 
         # Pass 2: derived fields (eval → cast → fill_na), then post-filters
-        result_df = self._apply_derived_fields(result_df, effective_params, space_masks)
+        try:
+            result_df = self._apply_derived_fields(result_df, effective_params, space_masks)
+        except TransformError as exc:
+            _attach_debug(exc, STAGE_DERIVED_FIELDS, result_df)
+            raise
+        _snap(SNAP_AFTER_DERIVED_FIELDS, result_df)
+
         if self.config.post_filters:
-            result_df = self._apply_filters(result_df, effective_params, self.config.post_filters)
+            try:
+                result_df = self._apply_filters(result_df, effective_params, self.config.post_filters)
+            except TransformError as exc:
+                _attach_debug(exc, STAGE_POST_FILTERS, result_df)
+                raise
+            _snap(SNAP_AFTER_POST_FILTERS, result_df)
             # Recompute space masks — post-filters may have dropped rows, invalidating indices
             if space_selectors:
                 space_masks = self._compute_space_selector_masks(
@@ -226,10 +435,14 @@ class EntityPipeline:
 
         if report.has_errors:
             logger.error("Validation failed with %d errors", report.error_count)
-            raise ValidationError(report=report, message=report.format_detail())
+            exc = ValidationError(report=report, message=report.format_detail())
+            _attach_debug(exc, STAGE_VALIDATION, result_df)
+            raise exc
 
         if report.has_warnings:
             logger.warning("Validation completed with %d warnings", report.warning_count)
+
+        _snap(SNAP_AFTER_VALIDATION, result_df)
 
         # 4b. Process sub-entities (nested fields with entity_ref)
         sub_entity_classes = process_sub_entity_fields(
@@ -255,6 +468,8 @@ class EntityPipeline:
         )
         logger.info("=" * 60)
 
+        _snap(SNAP_FINAL, entity_df)
+
         return PipelineResult(
             entity_class=entity_cls,
             entities=entities,
@@ -271,6 +486,7 @@ class EntityPipeline:
                 }} if space_masks else {}),
             },
             sub_entity_classes=sub_entity_classes,
+            snapshots=snapshots,
         )
 
     # ------------------------------------------------------------------
@@ -518,36 +734,44 @@ class EntityPipeline:
                 continue
 
             mask = masks.get(field.space) if field.space else None
-            expr = field.derived.strip()
-            fn = None
-            try:
-                if expr.startswith("lambda"):
-                    expr = normalize_lambda_at_params(expr)
-                    fn = eval(expr, lambda_ns)  # noqa: S307
-                    if mask is not None:
-                        result[field.name] = None
-                        result.loc[mask, field.name] = result.loc[mask].apply(fn, axis=1)
+
+            if isinstance(field.derived, DerivedFunctionRef):
+                # Function reference — import and apply row-wise
+                result = self._apply_derived_function(
+                    result, field.name, field.derived, mask, params,
+                )
+            else:
+                # Inline expression — eval or lambda
+                expr = field.derived.strip()
+                fn = None
+                try:
+                    if expr.startswith("lambda"):
+                        expr = normalize_lambda_at_params(expr)
+                        fn = eval(expr, lambda_ns)  # noqa: S307
+                        if mask is not None:
+                            result[field.name] = None
+                            result.loc[mask, field.name] = result.loc[mask].apply(fn, axis=1)
+                        else:
+                            result[field.name] = result.apply(fn, axis=1)
                     else:
-                        result[field.name] = result.apply(fn, axis=1)
-                else:
-                    if mask is not None:
-                        result[field.name] = None
-                        result.loc[mask, field.name] = result.loc[mask].eval(
-                            expr, resolvers=[self._expression_namespace], local_dict=params,
-                        )
-                    else:
-                        result[field.name] = result.eval(expr, resolvers=[self._expression_namespace], local_dict=params)
-            except Exception as exc:
-                diag, samples = "", []
-                if expr.startswith("lambda") and fn is not None:
-                    diag, samples = format_lambda_diagnostic(result, fn)
-                hint = enhance_expression_error(exc, self.config.expression_packages)
-                raise TransformError(
-                    f"Field '{field.name}': derived expression "
-                    f"'{field.derived}' failed: {exc}.{diag}{hint}",
-                    field=field.name,
-                    failing_samples=samples,
-                ) from exc
+                        if mask is not None:
+                            result[field.name] = None
+                            result.loc[mask, field.name] = result.loc[mask].eval(
+                                expr, resolvers=[self._expression_namespace], local_dict=params,
+                            )
+                        else:
+                            result[field.name] = result.eval(expr, resolvers=[self._expression_namespace], local_dict=params)
+                except Exception as exc:
+                    diag, samples = "", []
+                    if expr.startswith("lambda") and fn is not None:
+                        diag, samples = format_lambda_diagnostic(result, fn)
+                    hint = enhance_expression_error(exc, self.config.expression_packages)
+                    raise TransformError(
+                        f"Field '{field.name}': derived expression "
+                        f"'{field.derived}' failed: {exc}.{diag}{hint}",
+                        field=field.name,
+                        failing_samples=samples,
+                    ) from exc
             logger.info("  Field '%s': derived from expression", field.name)
             result = cast_and_fill(result, field.name, field.dtype, field.fill_na, self._caster)
             # For flag-mode space fields, reset non-matching rows to None after cast
@@ -555,6 +779,65 @@ class EntityPipeline:
                 result.loc[~mask, field.name] = None
 
         return result
+
+    def _apply_derived_function(
+        self, df: pd.DataFrame, field_name: str,
+        ref: DerivedFunctionRef, mask: pd.Series | None,
+        parameters: dict[str, Any] | None = None,
+    ) -> pd.DataFrame:
+        """Apply a derived function reference (row-wise).
+
+        The function is imported from the dotted path and called per row via
+        ``df.apply(fn, axis=1)``. Config ``kwargs`` are resolved and passed
+        as keyword arguments. Values starting with ``@`` are resolved from
+        runtime parameters (e.g. ``threshold: "@snapshot_date"`` passes the
+        runtime value of ``snapshot_date`` as the ``threshold`` kwarg).
+        """
+        import functools
+
+        try:
+            fn = import_dotted_path(ref.function, error_class=TransformError)
+        except TransformError:
+            raise
+        except Exception as exc:
+            raise TransformError(
+                f"Field '{field_name}': cannot import function '{ref.function}': {exc}"
+            ) from exc
+
+        # Resolve @param references in kwargs values
+        params = parameters or {}
+        resolved_kwargs: dict[str, Any] = {}
+        for k, v in ref.kwargs.items():
+            if isinstance(v, str) and v.startswith("@"):
+                param_name = v[1:]
+                if param_name in params:
+                    resolved_kwargs[k] = params[param_name]
+                else:
+                    raise TransformError(
+                        f"Field '{field_name}': kwarg '{k}' references parameter "
+                        f"'@{param_name}' but it is not defined in parameters. "
+                        f"Available: {sorted(params)}"
+                    )
+            else:
+                resolved_kwargs[k] = v
+
+        if resolved_kwargs:
+            fn = functools.partial(fn, **resolved_kwargs)
+
+        try:
+            if mask is not None:
+                df[field_name] = None
+                df.loc[mask, field_name] = df.loc[mask].apply(fn, axis=1)
+            else:
+                df[field_name] = df.apply(fn, axis=1)
+        except Exception as exc:
+            diag, samples = format_lambda_diagnostic(df, fn)
+            raise TransformError(
+                f"Field '{field_name}': function '{ref.function}' failed: {exc}.{diag}",
+                field=field_name,
+                failing_samples=samples,
+            ) from exc
+        return df
 
     def _run_field_validations(
         self, df: pd.DataFrame, pass_filter: str | None = None,
@@ -613,3 +896,17 @@ class EntityPipeline:
             logger.info("  Validation [%s]: %s", status, result.message)
 
         return report
+
+    def _get_field_expression(self, field_name: str | None) -> str | None:
+        """Look up the expression/function path for a field by name."""
+        if not field_name:
+            return None
+        for f in self.config.fields:
+            if f.name == field_name:
+                if isinstance(f.derived, DerivedFunctionRef):
+                    return f"fn:{f.derived.function}"
+                if isinstance(f.derived, str):
+                    return f.derived
+                if isinstance(f.source, str):
+                    return f.source
+        return None

@@ -52,6 +52,12 @@ src/impact/
    - `"filter"` (default) — custom pre/post filters are appended to primary filters and reduce the dataset. Use for single-model development where the modeling scope is defined in the custom config.
    - `"flag"` — custom pre/post filters become row selectors (space selectors). The full dataset is preserved; only matching rows get the custom space applied. Non-matching rows keep primary fields only (no space). Use for composite engines where all models run across the full portfolio. Space fields are computed only for matching rows (non-matching get `None`). Metadata includes `space_selector_counts` with match counts per space. The same custom config works in both modes — the mode is chosen at pipeline creation time, not in the YAML config.
 8. **Expression packages** — Configurable packages available in eval/lambda expressions via `expression_packages` config. Default: `{pd: pandas, np: numpy}`. Source names cannot conflict with package aliases. Unsafe names (`os`, `sys`, `subprocess`, `shutil`) are always blocked as source names.
+9. **Parse-time expression validation** — All `source` and `derived` expression strings are compiled at config parse time (before any data is loaded). Catches syntax errors like mismatched parentheses, bad lambda syntax, and typos immediately at config validation. `@param` references are normalized before compilation since they are valid pandas eval syntax but not valid Python syntax.
+10. **Derived function references** — For complex derived logic, `derived` accepts a function reference (`{function: "pkg.module.func", kwargs: {...}}`) instead of an inline expression string. The function receives a row (`pd.Series`) and returns a scalar. Kwargs values can be literals (`threshold: 0.5`) or `@param` references (`snapshot_date: "@snapshot_date"`) resolved from runtime parameters. This gives full IDE support: syntax highlighting, breakpoints, linting, type checking, and independent unit testability. Simple expressions stay in YAML; complex logic moves to Python files.
+11. **Debug mode** — Three debug features for pipeline development:
+    - `pipeline.explain()` — prints execution plan (sources, joins, filters, fields, validations) without loading data.
+    - `pipeline.run(debug=True)` — saves DataFrame snapshots at each stage boundary on `result.snapshots` (keys: `after_join`, `after_pre_filters`, `after_source_fields`, `after_derived_fields`, `after_post_filters`, `after_validation`, `final`).
+    - Debug context on exceptions — when `debug=True`, `TransformError` and `ValidationError` get a `.debug_context` attribute (`DebugContext` dataclass) with `dataframe`, `field`, `expression`, `parameters`, and `stage`. Stays scoped on the exception object — no namespace contamination.
 
 ### YAML Config Structure
 
@@ -134,6 +140,16 @@ fields:
                                  #   row-wise lambda:   "lambda row: row['a'] * 2"
                                  #   Parameters: @param in both eval and lambda
                                  #   pd/np available directly: pd.isna(col) in both eval and lambda
+    #
+    # derived (function ref) — for complex logic, reference a Python function
+    #   instead of inline expressions. Full IDE support: syntax highlighting,
+    #   breakpoints, linting, type checking, unit testing.
+    derived:                     #   function ref form:
+      function: "pkg.mod.func"   #     dotted import path to a row-wise function
+      kwargs:                    #     optional static keyword arguments
+        threshold: 0.5           #     def func(row, threshold=0.5): ...
+                                 #   Runtime parameters are also passed as kwargs automatically.
+                                 #   Config kwargs take precedence over parameters on conflict.
 
     # --- Type casting (required) ---
     dtype: <type>                # cast the column to this type after source/derived.
@@ -260,6 +276,28 @@ result.dataframe           # Processed pandas DataFrame
 result.validation_report   # Aggregated validation results
 result.metadata            # Dict: entity_name, entity_version, source_count, record_count, field_count
 result.sub_entity_classes  # Dict: field_name → sub-entity class (e.g. {"collateral_items": Collateral})
+result.snapshots           # Dict: stage → DataFrame (only populated when debug=True)
+
+# Debug mode — execution plan, stage snapshots, and debug context on errors
+pipeline = EntityPipeline("configs/facility_example.yaml")
+print(pipeline.explain())  # Show execution plan without loading data
+
+result = pipeline.run(debug=True)  # Save DataFrame snapshots at each stage
+result.snapshots["after_join"]           # DataFrame right after joins
+result.snapshots["after_source_fields"]  # After Pass 1 (source fields)
+result.snapshots["after_derived_fields"] # After Pass 2 (derived fields)
+result.snapshots["final"]               # Final entity DataFrame
+
+# When debug=True and an error occurs, inspect the live state:
+try:
+    result = pipeline.run(debug=True)
+except TransformError as e:
+    ctx = e.debug_context          # DebugContext dataclass
+    ctx.dataframe                  # DataFrame at point of failure
+    ctx.field                      # Field being processed
+    ctx.expression                 # Expression or function path
+    ctx.parameters                 # Effective parameters
+    ctx.stage                      # Pipeline stage name
 ```
 
 ## Key Implementation Details
@@ -282,8 +320,8 @@ ImpactError
 ├── ConfigError        — invalid/missing YAML config
 ├── SourceError        — data source load failure
 ├── JoinError          — join operation failure
-├── TransformError     — transformation step failure (has .field, .failing_samples)
-├── ValidationError    — severity=error validation failure (has .report; use .report.format_detail())
+├── TransformError     — transformation step failure (has .field, .failing_samples, .debug_context)
+├── ValidationError    — severity=error validation failure (has .report, .debug_context)
 └── EntityBuildError   — dynamic class creation or instantiation failure
 ```
 

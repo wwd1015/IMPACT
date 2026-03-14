@@ -30,6 +30,7 @@ A YAML-config-driven platform for financial lending credit modeling, providing s
   - [Adding a New Validator](#adding-a-new-validator)
   - [Adding a New Built-in Expression](#adding-a-new-built-in-expression)
   - [Diagnostics and Debugging](#diagnostics-and-debugging)
+    - [Debug Mode](#debug-mode)
   - [Exception Hierarchy](#exception-hierarchy)
   - [Running Tests](#running-tests)
 
@@ -503,7 +504,50 @@ Derived fields run after Pass 1 and have access to the **full DataFrame** — al
 - name: safe_amount
   derived: "lambda row: 0.0 if pd.isna(row['amount']) else row['amount']"
   dtype: float64
+
+# Function reference — for complex logic, reference a Python function
+# instead of inline expressions. Full IDE support: syntax highlighting,
+# breakpoints, linting, type checking, and independent unit testing.
+- name: risk_score
+  derived:
+    function: "myproject.expressions.compute_risk_score"
+    kwargs:                    # optional keyword arguments
+      threshold: 0.5           # literal value
+      snapshot_date: "@snapshot_date"  # resolved from runtime parameters
+  dtype: float64
 ```
+
+The function receives a row (`pd.Series`) and returns a scalar. Kwargs support two value types:
+- **Literal values** — `threshold: 0.5` passes `0.5` directly
+- **`@param` references** — `snapshot_date: "@snapshot_date"` resolves from runtime parameters (config `parameters` block or `pipeline.run(parameters={...})`)
+
+```python
+# myproject/expressions.py — full IDE support, breakpoints, tests
+def compute_risk_score(row, threshold=0.5, snapshot_date="2025-01-01"):
+    """Row-wise risk scoring with proper tooling.
+
+    Args:
+        row: pd.Series — the current row.
+        threshold: 0.5 from config kwargs (literal).
+        snapshot_date: resolved from @snapshot_date parameter.
+    """
+    if row["product_category"] == "REVOLVER":
+        base = row["utilization_rate"] * 0.6
+    else:
+        base = row["outstanding_balance"] / row["commitment_amount"] * 0.4
+    return base if base > threshold else 0.0
+```
+
+```python
+# @snapshot_date in kwargs resolves from runtime parameters
+result = EntityPipeline("config.yaml").run(
+    parameters={"snapshot_date": "2026-06-15"}  # → threshold=0.5, snapshot_date="2026-06-15"
+)
+```
+
+> **When to use inline vs function ref:** Simple expressions (`amount * 0.01`, `col_a / col_b`) are fine as inline strings. Multi-line logic, conditional branching, or anything you'd want to step through with a debugger should use a function reference.
+
+All expressions (both `source` and `derived` strings) are **validated at config parse time** — syntax errors like mismatched parentheses or bad lambda syntax are caught before any data is loaded.
 
 ---
 
@@ -1165,6 +1209,94 @@ set_max_samples(0)    # disable sample collection entirely
 
 **Key files:** `src/impact/entity/validate/base.py` (ValidationResult, collect_failing_samples), `src/impact/common/utils.py` (diagnose_cast_failure, diagnose_lambda_failure).
 
+#### Debug Mode
+
+The pipeline provides three debug features for interactive development:
+
+**A. Execution Plan (`explain()`)** — inspect the pipeline's plan without loading any data:
+
+```python
+pipeline = EntityPipeline("configs/facility.yaml")
+print(pipeline.explain())
+```
+
+Output:
+
+```
+Entity: Facility (v1.0)
+
+Sources (2):
+  facility_main (csv) [PRIMARY]
+  collateral (csv)
+
+Joins (1):
+  facility_main ↔ collateral (left, one_to_many)
+    on: facility_id = facility_id
+
+Fields (6):
+  Pass 1 — source fields (4):
+    facility_id (str): facility_id [PK]
+    commitment_amount (float64): commitment_amount
+    ...
+  Pass 2 — derived fields (2):
+    utilization_rate (float64): outstanding_balance / commitment_amount
+    risk_score (float64): fn:myproject.scoring.compute_risk kwargs={'threshold': 0.5}
+
+Execution order:
+  1. Load sources
+  2. Execute joins
+  3. Pass 1: 4 source fields
+  4. Validate source fields
+  5. Pass 2: 2 derived fields
+  6. Validate derived + global
+  7. Build Facility class (6 fields)
+```
+
+**B. Stage Snapshots (`run(debug=True)`)** — inspect DataFrame state at each stage boundary:
+
+```python
+result = pipeline.run(debug=True)
+
+# Available snapshots (dict[str, pd.DataFrame]):
+result.snapshots["after_join"]            # raw data after joins
+result.snapshots["after_pre_filters"]     # after pre-filter reduction (if any)
+result.snapshots["after_source_fields"]   # after Pass 1 (rename, cast, fill)
+result.snapshots["after_derived_fields"]  # after Pass 2 (derived expressions)
+result.snapshots["after_post_filters"]    # after post-filter reduction (if any)
+result.snapshots["after_validation"]      # after all validations pass
+result.snapshots["final"]                 # entity-only columns (temp fields dropped)
+```
+
+Each snapshot is an independent copy — safe to modify without affecting the pipeline.
+
+**C. Debug Context on Exceptions** — when `debug=True`, failed pipelines attach the live state to the exception:
+
+```python
+from impact.common.exceptions import TransformError, ValidationError
+
+try:
+    result = pipeline.run(debug=True)
+except TransformError as e:
+    ctx = e.debug_context           # DebugContext dataclass
+    ctx.dataframe                   # DataFrame at point of failure
+    ctx.field                       # "risk_score"
+    ctx.expression                  # "fn:myproject.scoring.compute_risk"
+    ctx.parameters                  # {"snapshot_date": "2025-12-31"}
+    ctx.stage                       # "derived_fields"
+
+    # In a notebook — inspect the live data interactively
+    ctx.dataframe.head()
+    ctx.dataframe[ctx.field].describe()
+
+except ValidationError as e:
+    ctx = e.debug_context
+    ctx.dataframe                   # full DataFrame when validation failed
+    ctx.stage                       # "source_validation" or "validation"
+    print(e.report.format_detail()) # detailed validation report
+```
+
+The `DebugContext` stays scoped on the exception object — it does not inject variables into your notebook namespace. Without `debug=True`, `debug_context` is `None` and snapshots are empty (zero overhead).
+
 ---
 
 ### Exception Hierarchy
@@ -1177,8 +1309,9 @@ ImpactError
 ├── SourceError       — data source load failure
 ├── JoinError         — join execution failure
 ├── TransformError    — field expression / filter eval failure, cast failure
-│                       carries .field and .failing_samples for row-level diagnostics
-├── ValidationError   — error-severity validation failure; carries .report attribute
+│                       carries .field, .failing_samples, and .debug_context (when debug=True)
+├── ValidationError   — error-severity validation failure
+│                       carries .report and .debug_context (when debug=True)
 │                       .report.format_detail() for full diagnostic output
 └── EntityBuildError  — dynamic dataclass creation failure
 ```
